@@ -8,6 +8,7 @@ import json
 import math
 import pickle
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,28 +93,62 @@ def resolve_runtime_output_root(
     return Path(notebook_root).expanduser().resolve() / "tmp" / "session1_outputs"
 
 
-def stage_cache_into_runtime(
-    persistent_cache_dir: str | Path,
-    runtime_cache_dir: str | Path,
+def _render_copy_progress(
+    label: str,
+    copied_files: int,
+    total_files: int,
+    copied_bytes: int,
+    total_bytes: int,
+) -> None:
+    """Render a simple terminal-friendly progress bar for notebook staging steps."""
+    total_files = max(total_files, 1)
+    total_bytes = max(total_bytes, 1)
+    fraction = copied_bytes / total_bytes
+    bar_width = 24
+    filled = min(bar_width, int(round(bar_width * fraction)))
+    bar = "#" * filled + "-" * (bar_width - filled)
+    copied_gb = copied_bytes / (1024 ** 3)
+    total_gb = total_bytes / (1024 ** 3)
+    message = (
+        f"\r{label}: [{bar}] {fraction:6.1%} | "
+        f"{copied_files:>4}/{total_files:<4} files | "
+        f"{copied_gb:6.2f}/{total_gb:6.2f} GB"
+    )
+    sys.stdout.write(message)
+    sys.stdout.flush()
+
+
+def stage_directory_into_runtime(
+    source_dir: str | Path,
+    runtime_dir: str | Path,
     *,
     force: bool = False,
+    show_progress: bool = False,
+    progress_label: str = "Staging files",
 ) -> dict[str, object]:
-    """Copy a read-only prepared cache into a writable runtime directory."""
-    persistent_cache_dir = Path(persistent_cache_dir).expanduser().resolve()
-    runtime_cache_dir = Path(runtime_cache_dir).expanduser().resolve()
+    """Copy a read-only source directory into a writable runtime directory.
 
-    if persistent_cache_dir == runtime_cache_dir:
-        return {"staged": False, "reason": "runtime cache already points at the persistent cache"}
-    if not persistent_cache_dir.exists():
-        raise FileNotFoundError(f"Persistent cache directory does not exist: {persistent_cache_dir}")
+    This is used for FIR notebook runs where shared project storage is the
+    long-lived source of truth, but node-local job storage such as
+    ``$SLURM_TMPDIR`` is much faster for interactive work.
+    """
+    source_dir = Path(source_dir).expanduser().resolve()
+    runtime_dir = Path(runtime_dir).expanduser().resolve()
 
+    if source_dir == runtime_dir:
+        return {"staged": False, "reason": "runtime directory already points at the source directory"}
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
+
+    files_to_copy: list[tuple[Path, Path]] = []
+    total_bytes = 0
     copied_files = 0
     copied_bytes = 0
-    runtime_cache_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    for source_path in persistent_cache_dir.rglob("*"):
-        relative_path = source_path.relative_to(persistent_cache_dir)
-        destination_path = runtime_cache_dir / relative_path
+    for source_path in source_dir.rglob("*"):
+        relative_path = source_path.relative_to(source_dir)
+        destination_path = runtime_dir / relative_path
         if source_path.is_dir():
             destination_path.mkdir(parents=True, exist_ok=True)
             continue
@@ -123,17 +158,59 @@ def stage_cache_into_runtime(
             should_copy = True
 
         if should_copy:
-            destination_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, destination_path)
-            copied_files += 1
-            copied_bytes += source_path.stat().st_size
+            files_to_copy.append((source_path, destination_path))
+            total_bytes += source_path.stat().st_size
+
+    total_files = len(files_to_copy)
+    if show_progress:
+        _render_copy_progress(progress_label, 0, total_files, 0, total_bytes)
+
+    for source_path, destination_path in files_to_copy:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        file_size = source_path.stat().st_size
+        shutil.copy2(source_path, destination_path)
+        copied_files += 1
+        copied_bytes += file_size
+        if show_progress:
+            _render_copy_progress(progress_label, copied_files, total_files, copied_bytes, total_bytes)
+
+    if show_progress:
+        if total_files == 0:
+            sys.stdout.write(f"{progress_label}: already staged; nothing to copy.\n")
+        else:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
 
     return {
         "staged": True,
+        "source_dir": str(source_dir),
+        "runtime_dir": str(runtime_dir),
         "copied_files": copied_files,
+        "total_files": total_files,
         "copied_gb": round(copied_bytes / (1024 ** 3), 3),
-        "runtime_cache_dir": str(runtime_cache_dir),
+        "total_gb": round(total_bytes / (1024 ** 3), 3),
     }
+
+
+def stage_cache_into_runtime(
+    persistent_cache_dir: str | Path,
+    runtime_cache_dir: str | Path,
+    *,
+    force: bool = False,
+    show_progress: bool = False,
+    progress_label: str = "Staging cache",
+) -> dict[str, object]:
+    """Copy a read-only prepared cache into a writable runtime directory."""
+    stage_result = stage_directory_into_runtime(
+        source_dir=persistent_cache_dir,
+        runtime_dir=runtime_cache_dir,
+        force=force,
+        show_progress=show_progress,
+        progress_label=progress_label,
+    )
+    if stage_result.get("staged"):
+        stage_result["runtime_cache_dir"] = str(Path(runtime_cache_dir).expanduser().resolve())
+    return stage_result
 
 
 def evenly_spaced_take(frame: pd.DataFrame, limit: int | None) -> pd.DataFrame:
