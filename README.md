@@ -14,7 +14,7 @@ The first notebook is the main teaching notebook. The second is the advanced not
 ### 1. SSH to FIR
 
 ```bash
-ssh fir
+ssh <username>@fir.alliancecan.ca
 ```
 
 ### 2. Clone the repo into your `HOME` space
