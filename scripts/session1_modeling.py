@@ -46,6 +46,9 @@ MEASUREMENT_COLUMNS = [
     "Temperature (C)",
 ]
 
+DEFAULT_CACHE_STEM = "scalar_session1"
+LEGACY_CACHE_STEMS = (DEFAULT_CACHE_STEM, "ctd_session1")
+
 QC_FLAG_MEANINGS = {
     0: "no QC",
     1: "good",
@@ -70,6 +73,59 @@ DEFAULT_FLAG_PALETTE = {
     9: "#7f7f7f",
     34: "#e76f51",
 }
+
+
+@dataclass(frozen=True)
+class CacheBundlePaths:
+    """Paths for one named cache bundle under a shared cache root."""
+
+    root: Path
+    stem: str
+    row_level_dir: Path
+    window_cache_path: Path
+    metadata_path: Path
+
+
+def _normalize_cache_stem(cache_stem: str) -> str:
+    """Normalize and validate a cache bundle stem."""
+
+    normalized = cache_stem.strip()
+    if not normalized:
+        raise ValueError("cache stem must not be empty")
+    if any(separator in normalized for separator in ("/", "\\")):
+        raise ValueError("cache stem must be a simple name, not a path")
+    return normalized
+
+
+def build_cache_bundle_paths(
+    cache_dir: str | Path,
+    cache_stem: str = DEFAULT_CACHE_STEM,
+) -> CacheBundlePaths:
+    """Build row/window/metadata paths for one named cache bundle."""
+
+    cache_root = Path(cache_dir).expanduser().resolve()
+    stem = _normalize_cache_stem(cache_stem)
+    return CacheBundlePaths(
+        root=cache_root,
+        stem=stem,
+        row_level_dir=cache_root / f"{stem}_row_level",
+        window_cache_path=cache_root / f"{stem}_windowed_features.parquet",
+        metadata_path=cache_root / f"{stem}_metadata.json",
+    )
+
+
+def resolve_cache_bundle_paths(
+    cache_dir: str | Path,
+    cache_stem: str | None = None,
+) -> CacheBundlePaths:
+    """Resolve an existing bundle, with legacy CTD fallbacks when needed."""
+
+    stems_to_try = [cache_stem] if cache_stem is not None else list(LEGACY_CACHE_STEMS)
+    for stem in stems_to_try:
+        candidate = build_cache_bundle_paths(cache_dir, stem)
+        if candidate.metadata_path.exists():
+            return candidate
+    return build_cache_bundle_paths(cache_dir, stems_to_try[0])
 
 
 def resolve_runtime_output_root(
@@ -243,6 +299,7 @@ def select_part_paths(part_paths: list[Path], limit: int | None, mode: str = "sp
 def load_cache_bundle(
     cache_dir: str | Path,
     *,
+    cache_stem: str | None = None,
     row_file_limit: int | None = None,
     part_selection_mode: str = "spread",
     rows_per_file: int = 45000,
@@ -253,10 +310,10 @@ def load_cache_bundle(
     window_columns: list[str] | None = None,
 ) -> dict[str, object]:
     """Load metadata plus row- and window-level samples from the prepared cache."""
-    cache_path = Path(cache_dir)
-    metadata_path = cache_path / "ctd_session1_metadata.json"
-    row_cache_dir = cache_path / "ctd_session1_row_level"
-    window_cache_path = cache_path / "ctd_session1_windowed_features.parquet"
+    bundle_paths = resolve_cache_bundle_paths(cache_dir, cache_stem=cache_stem)
+    metadata_path = bundle_paths.metadata_path
+    row_cache_dir = bundle_paths.row_level_dir
+    window_cache_path = bundle_paths.window_cache_path
 
     metadata = json.loads(metadata_path.read_text())
     part_paths = sorted(row_cache_dir.glob("*.parquet"))
@@ -336,6 +393,7 @@ def build_model_frame(
     df: pd.DataFrame,
     *,
     target_flag: str,
+    measurement_columns: list[str],
     task_mode: str,
     model_row_limit: int | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -347,10 +405,10 @@ def build_model_frame(
     model_df["day_of_year"] = model_df["Time UTC"].dt.dayofyear
 
     # Absolute deltas are a simple way to expose sudden sensor changes to the model.
-    for column in MEASUREMENT_COLUMNS:
+    for column in measurement_columns:
         model_df[f"{column} abs_delta"] = model_df[column].diff().abs().fillna(0.0)
 
-    feature_columns = MEASUREMENT_COLUMNS + [f"{column} abs_delta" for column in MEASUREMENT_COLUMNS] + [
+    feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns] + [
         "hour_utc",
         "minute_utc",
         "day_of_year",
@@ -374,6 +432,7 @@ def build_model_frame(
 def add_temporal_context_features(
     frame: pd.DataFrame,
     *,
+    measurement_columns: list[str],
     lag_steps: tuple[int, ...] = (1, 3, 5),
     rolling_windows: tuple[int, ...] = (5, 15),
 ) -> tuple[pd.DataFrame, list[str]]:
@@ -381,7 +440,7 @@ def add_temporal_context_features(
     work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
     context_columns: list[str] = []
 
-    for column in MEASUREMENT_COLUMNS:
+    for column in measurement_columns:
         for lag in lag_steps:
             feature_name = f"{column} lag_{lag}"
             work[feature_name] = work[column].shift(lag)
@@ -883,7 +942,7 @@ def plot_time_series_with_bands(
     fig, axes = plt.subplots(
         row_count,
         1,
-        figsize=(15, 3.2 + 1.3 * len(band_specs)),
+        figsize=(16.5, 3.2 + 1.3 * len(band_specs)),
         sharex=True,
         gridspec_kw={"height_ratios": height_ratios},
     )
@@ -907,6 +966,8 @@ def plot_time_series_with_bands(
             Line2D([0], [0], color="#059669", linewidth=2, label=secondary_column),
         ],
         loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
         frameon=True,
     )
 
@@ -938,11 +999,18 @@ def plot_time_series_with_bands(
             for label in label_order[:8]
         ]
         if legend_handles:
-            axis.legend(handles=legend_handles, loc="upper left", ncol=min(4, len(legend_handles)), frameon=True)
+            axis.legend(
+                handles=legend_handles,
+                loc="upper left",
+                bbox_to_anchor=(1.01, 1.0),
+                borderaxespad=0.0,
+                ncol=1,
+                frameon=True,
+            )
 
     axes[-1].set_xlabel("Time UTC")
     fig.suptitle(title, y=1.01)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     return fig
 
 
@@ -1112,6 +1180,39 @@ def predict_transformer_window_model(
     return np.concatenate(predictions) if predictions else np.array([], dtype=int)
 
 
+def predict_transformer_sequence_model(
+    model: nn.Module,
+    raw_sequences: np.ndarray,
+    *,
+    task_mode: str,
+    class_labels: list[int],
+    device: str,
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """Run a sequence-labeling transformer and return one prediction per timestep."""
+    _require_torch()
+    if len(raw_sequences) == 0:
+        return np.empty((0, 0), dtype=int)
+
+    model.eval()
+    tensor = torch.from_numpy(raw_sequences).float()
+    normalized = (tensor - torch.as_tensor(feature_mean).float()) / torch.as_tensor(feature_std).float()
+    predictions = []
+    with torch.no_grad():
+        for start_index in range(0, len(normalized), batch_size):
+            batch = normalized[start_index : start_index + batch_size].to(device)
+            logits = model(batch)
+            if task_mode == "multiclass":
+                batch_predictions = logits.argmax(dim=-1).cpu().numpy()
+                batch_predictions = np.take(np.asarray(class_labels, dtype=int), batch_predictions)
+            else:
+                batch_predictions = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy().astype(int)
+            predictions.append(batch_predictions)
+    return np.concatenate(predictions, axis=0) if predictions else np.empty((0, 0), dtype=int)
+
+
 def predict_sequence_label_cnn(
     model: nn.Module,
     raw_sequences: np.ndarray,
@@ -1137,8 +1238,21 @@ def predict_sequence_label_cnn(
             batch = normalized[start_index : start_index + batch_size].to(device)
             logits = model(batch)
             if task_mode == "multiclass":
-                batch_predictions = logits.argmax(dim=1).cpu().numpy()
-                batch_predictions = np.vectorize(lambda index: class_labels[int(index)])(batch_predictions).astype(int)
+                if logits.ndim != 3:
+                    raise ValueError(
+                        "Expected multiclass sequence CNN logits to have three dimensions "
+                        f"(batch, time, classes) or (batch, classes, time), got shape {tuple(logits.shape)}."
+                    )
+                if logits.shape[-1] == len(class_labels):
+                    batch_predictions = logits.argmax(dim=-1).cpu().numpy()
+                elif logits.shape[1] == len(class_labels):
+                    batch_predictions = logits.argmax(dim=1).cpu().numpy()
+                else:
+                    raise ValueError(
+                        "Could not align CNN logits with class labels: "
+                        f"logits shape {tuple(logits.shape)}, class count {len(class_labels)}."
+                    )
+                batch_predictions = np.take(np.asarray(class_labels, dtype=int), batch_predictions)
             else:
                 batch_predictions = (torch.sigmoid(logits.squeeze(1)) >= 0.5).long().cpu().numpy().astype(int)
             predictions.append(batch_predictions)
@@ -1156,7 +1270,14 @@ def plot_flag_examples(
     region_alpha: float = 0.18,
     show_flag_points: bool = True,
 ) -> tuple[plt.Figure, pd.DataFrame]:
-    """Plot representative QC-flag examples with shaded regions and sensor traces."""
+    """Plot representative QC-flag examples with shaded regions and sensor traces.
+
+    The important detail is that each plotted panel should stay *locally
+    contiguous in time*. When the incoming dataframe contains rows from several
+    source files or discontinuous time chunks, we therefore choose the plotting
+    window from the same ``source_file`` as the representative flagged row
+    rather than slicing across the globally sorted dataframe.
+    """
     available_classes = [flag for flag in classes if flag in set(df[target_flag].dropna().astype(int).unique())]
     if not available_classes:
         raise ValueError(f"No requested classes found in {target_flag}")
@@ -1173,9 +1294,27 @@ def plot_flag_examples(
     for axis, flag in zip(axes, available_classes):
         flag_rows = work.index[work[target_flag].fillna(-1).astype(int) == flag].tolist()
         center_index = flag_rows[len(flag_rows) // 2]
-        start = max(center_index - points_per_panel // 2, 0)
-        stop = min(start + points_per_panel, len(work))
-        panel = work.iloc[start:stop].copy()
+        center_row = work.loc[center_index]
+
+        # Keep the context panel inside the same source file when possible so a
+        # "local" example does not accidentally jump across large time gaps.
+        if "source_file" in work.columns and pd.notna(center_row.get("source_file")):
+            source_file = center_row["source_file"]
+            source_panel = work[work["source_file"] == source_file].sort_values("Time UTC").reset_index(drop=True)
+            source_flag_rows = source_panel.index[source_panel[target_flag].fillna(-1).astype(int) == flag].tolist()
+            if source_flag_rows:
+                source_center_index = source_flag_rows[len(source_flag_rows) // 2]
+                start = max(source_center_index - points_per_panel // 2, 0)
+                stop = min(start + points_per_panel, len(source_panel))
+                panel = source_panel.iloc[start:stop].copy()
+            else:
+                start = max(center_index - points_per_panel // 2, 0)
+                stop = min(start + points_per_panel, len(work))
+                panel = work.iloc[start:stop].copy()
+        else:
+            start = max(center_index - points_per_panel // 2, 0)
+            stop = min(start + points_per_panel, len(work))
+            panel = work.iloc[start:stop].copy()
         panel_spans = _iter_flag_spans(panel, target_flag)
         flags_in_panel = sorted({span_flag for span_flag, _, _ in panel_spans})
 
@@ -1248,8 +1387,8 @@ def plot_flag_examples(
                 "meaning": QC_FLAG_MEANINGS.get(flag, "unknown"),
                 "panel_start": panel["Time UTC"].min(),
                 "panel_end": panel["Time UTC"].max(),
-                "example_time": work.loc[center_index, "Time UTC"],
-                "source_file": clean_source_file_label(work.loc[center_index, "source_file"]),
+                "example_time": center_row["Time UTC"],
+                "source_file": clean_source_file_label(center_row["source_file"]) if "source_file" in work.columns else None,
             }
         )
 
@@ -1265,11 +1404,23 @@ def plot_cluster_window_examples(
     source_to_row_part: dict[str, str | Path],
     measurement_column: str = "Conductivity (S/m)",
     secondary_column: str = "Temperature (C)",
+    target_flag: str = "Conductivity QC Flag",
     examples_per_cluster: int = 1,
     context_points: int = 1500,
     highlight_alpha: float = 0.22,
+    flag_region_alpha: float = 0.14,
+    flag_palette: dict[int, str] | None = None,
 ) -> tuple[plt.Figure, pd.DataFrame]:
-    """Show representative k-means windows inside a wider sensor-time context."""
+    """Show representative k-means windows inside a wider sensor-time context.
+
+    Each panel now includes both:
+
+    - the highlighted window that supplied one k-means example, and
+    - the true QC-flag regions from the underlying row-level data.
+
+    That makes it easier to see whether a cluster prototype lines up with known
+    flagged behavior or with apparently normal operating periods.
+    """
     required_columns = {"cluster", "window_start", "window_end", "source_file", "distance_to_centroid", "issue_rate"}
     missing = required_columns.difference(clustered_window_df.columns)
     if missing:
@@ -1280,6 +1431,7 @@ def plot_cluster_window_examples(
     if not cluster_ids:
         raise ValueError("No clusters found in clustered_window_df")
 
+    palette = flag_palette or DEFAULT_FLAG_PALETTE
     cluster_colors = plt.cm.tab10(np.linspace(0, 1, len(cluster_ids)))
     cluster_palette = {cluster_id: cluster_colors[idx] for idx, cluster_id in enumerate(cluster_ids)}
 
@@ -1301,7 +1453,7 @@ def plot_cluster_window_examples(
         row_part_path = Path(source_to_row_part[source_file])
         panel = pd.read_parquet(
             row_part_path,
-            columns=["Time UTC", measurement_column, secondary_column],
+            columns=["Time UTC", measurement_column, secondary_column, target_flag],
         ).sort_values("Time UTC").reset_index(drop=True)
         panel["Time UTC"] = pd.to_datetime(panel["Time UTC"], utc=True)
 
@@ -1316,6 +1468,19 @@ def plot_cluster_window_examples(
 
         cluster_id = int(row["cluster"])
         cluster_color = cluster_palette[cluster_id]
+        flag_spans = _iter_flag_spans(context_panel, target_flag)
+
+        shown_flag_labels: set[int] = set()
+        for flag_value, span_start, span_end in flag_spans:
+            axis.axvspan(
+                span_start,
+                span_end,
+                color=palette.get(flag_value, "#9ca3af"),
+                alpha=flag_region_alpha,
+                linewidth=0,
+                zorder=-1,
+            )
+            shown_flag_labels.add(flag_value)
 
         axis.plot(
             context_panel["Time UTC"],
@@ -1336,7 +1501,7 @@ def plot_cluster_window_examples(
                 alpha=0.9,
                 zorder=3,
                 label="Points in highlighted k-means window",
-            )
+        )
         axis.axvspan(
             window_start,
             window_end,
@@ -1384,7 +1549,26 @@ def plot_cluster_window_examples(
                 label="Datapoints used inside that window",
             ),
         ]
+        for flag_value in sorted(shown_flag_labels):
+            legend_handles.append(
+                Patch(
+                    facecolor=palette.get(flag_value, "#9ca3af"),
+                    edgecolor="none",
+                    alpha=flag_region_alpha,
+                    label=f"QC region {flag_value}: {QC_FLAG_MEANINGS.get(flag_value, 'flagged')}",
+                )
+            )
         axis.legend(handles=legend_handles, loc="upper left", frameon=True)
+
+        highlighted_flags = (
+            target_points[target_flag]
+            .pipe(pd.to_numeric, errors="coerce")
+            .dropna()
+            .astype(int)
+            .value_counts()
+            .sort_index()
+            .to_dict()
+        )
 
         example_records.append(
             {
@@ -1397,6 +1581,7 @@ def plot_cluster_window_examples(
                 "context_start": context_panel["Time UTC"].min(),
                 "context_end": context_panel["Time UTC"].max(),
                 "rows_in_highlighted_window": int(len(target_points)),
+                "highlighted_window_flag_counts": highlighted_flags,
             }
         )
 
@@ -1406,21 +1591,71 @@ def plot_cluster_window_examples(
     return fig, pd.DataFrame(example_records)
 
 
-def fit_kmeans(window_df: pd.DataFrame, *, n_clusters: int, seed: int, n_init: str | int = "auto") -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fit k-means on window summary features and return assignments plus a summary."""
-    cluster_feature_columns = [
-        column
-        for column in window_df.columns
-        if column.endswith("_mean") or column.endswith("_std")
-    ]
-    cluster_input = window_df[cluster_feature_columns]
+def fit_kmeans(
+    frame: pd.DataFrame,
+    *,
+    n_clusters: int,
+    seed: int,
+    n_init: str | int = "auto",
+    feature_mode: str = "window_summary",
+    feature_columns: list[str] | None = None,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit k-means on either window summaries or row-level features.
+
+    Parameters
+    ----------
+    frame:
+        Input dataframe used for clustering.
+    feature_mode:
+        `"window_summary"` clusters on `_mean`/`_std` window features.
+        `"row_level"` clusters on the explicit `feature_columns`.
+    feature_columns:
+        Required for row-level mode. These columns become the clustering input.
+    """
+
+    if feature_mode == "window_summary":
+        cluster_feature_columns = [
+            column
+            for column in frame.columns
+            if column.endswith("_mean") or column.endswith("_std")
+        ]
+        if not cluster_feature_columns:
+            raise ValueError("No window-summary _mean/_std columns were found for k-means")
+        result = frame.copy()
+        if "issue_rate" not in result.columns:
+            raise ValueError("window_summary mode requires an issue_rate column")
+    elif feature_mode == "row_level":
+        if not feature_columns:
+            raise ValueError("row_level mode requires feature_columns")
+        cluster_feature_columns = [column for column in feature_columns if column in frame.columns]
+        if not cluster_feature_columns:
+            raise ValueError("None of the requested row-level feature columns were found for k-means")
+
+        result = frame.copy()
+        if time_column not in result.columns:
+            raise ValueError(f"row_level mode requires {time_column!r}")
+        if source_column not in result.columns:
+            raise ValueError(f"row_level mode requires {source_column!r}")
+
+        result["window_start"] = pd.to_datetime(result[time_column], utc=True)
+        result["window_end"] = pd.to_datetime(result[time_column], utc=True)
+        if "issue_rate" not in result.columns:
+            if "issue" in result.columns:
+                result["issue_rate"] = result["issue"].astype(float)
+            else:
+                raise ValueError("row_level mode requires either issue_rate or issue")
+    else:
+        raise ValueError(f"Unsupported k-means feature_mode: {feature_mode}")
+
+    cluster_input = result[cluster_feature_columns]
     cluster_input = pd.DataFrame(
         SimpleImputer(strategy="median").fit_transform(cluster_input),
         columns=cluster_feature_columns,
     )
     cluster_scaled = StandardScaler().fit_transform(cluster_input)
     kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init=n_init)
-    result = window_df.copy()
     result["cluster"] = kmeans.fit_predict(cluster_scaled)
     result["distance_to_centroid"] = kmeans.transform(cluster_scaled).min(axis=1)
     summary = (
@@ -1468,6 +1703,7 @@ class CnnDataBundle:
 def build_cnn_data(
     model_df: pd.DataFrame,
     *,
+    measurement_columns: list[str],
     task_mode: str,
     window_size: int,
     train_fraction: float,
@@ -1475,10 +1711,10 @@ def build_cnn_data(
     label_reduction: str,
 ) -> CnnDataBundle:
     """Build fixed-length windows and normalized tensors for the notebook CNN."""
-    cnn_df = model_df[MEASUREMENT_COLUMNS + ["model_target"]].copy().dropna().reset_index(drop=True)
+    cnn_df = model_df[measurement_columns + ["model_target"]].copy().dropna().reset_index(drop=True)
     usable_rows = (len(cnn_df) // window_size) * window_size
     cnn_df = cnn_df.iloc[:usable_rows]
-    raw_sequences = cnn_df[MEASUREMENT_COLUMNS].to_numpy(dtype=np.float32).reshape(-1, window_size, len(MEASUREMENT_COLUMNS))
+    raw_sequences = cnn_df[measurement_columns].to_numpy(dtype=np.float32).reshape(-1, window_size, len(measurement_columns))
     raw_window_targets = cnn_df["model_target"].to_numpy().reshape(-1, window_size)
 
     if task_mode == "multiclass":
@@ -1520,7 +1756,7 @@ def build_cnn_data(
         y_test=y_test,
         class_labels=class_labels,
         window_size=window_size,
-        feature_columns=MEASUREMENT_COLUMNS,
+        feature_columns=measurement_columns,
     )
 
 
@@ -1744,6 +1980,7 @@ def train_cnn_model(
 def run_cnn_search(
     model_df: pd.DataFrame,
     *,
+    measurement_columns: list[str],
     task_mode: str,
     seed: int,
     train_fraction: float,
@@ -1762,6 +1999,7 @@ def run_cnn_search(
         config = dict(zip(keys, values))
         data = build_cnn_data(
             model_df,
+            measurement_columns=measurement_columns,
             task_mode=task_mode,
             window_size=config["window_size"],
             train_fraction=train_fraction,

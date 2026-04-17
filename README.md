@@ -35,7 +35,17 @@ git clone git@github.com:Spiffical/daqathon.git daqathon
 cd daqathon
 ```
 
-### 3. Launch JupyterHub on FIR
+### 3. Install the shared Jupyter kernel once
+
+Each FIR user needs to install the shared DAQathon kernel into their own account one time:
+
+```bash
+jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
+```
+
+After that, the `Daqathon ML` kernel should appear in JupyterHub.
+
+### 4. Launch JupyterHub on FIR
 
 Open:
 
@@ -45,7 +55,7 @@ https://jupyterhub.fir.alliancecan.ca/
 
 Start your JupyterHub environment there.
 
-### 4. Open the notebooks from your cloned repo
+### 5. Open the notebooks from your cloned repo
 
 In the JupyterHub file browser:
 
@@ -147,7 +157,7 @@ If you choose to run the raw-to-parquet preparation step from inside a notebook,
 
 The notebooks import the following runtime helpers:
 
-- `scripts/prepare_ctd_session1_data.py`
+- `scripts/prepare_scalar_session1_data.py`
 - `scripts/session1_modeling.py`
 
 You do not need the local notebook-builder or local experiment-study scripts for the participant workflow.
