@@ -71,6 +71,7 @@ DEFAULT_FLAG_PALETTE = {
     7: "#14b8a6",
     8: "#a855f7",
     9: "#7f7f7f",
+    12: "#2563eb",
     34: "#e76f51",
 }
 
@@ -393,11 +394,23 @@ def build_model_frame(
     df: pd.DataFrame,
     *,
     target_flag: str,
-    measurement_columns: list[str],
+    measurement_columns: list[str] | None = None,
+    columns: list[str] | None = None,
     task_mode: str,
     model_row_limit: int | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """Create the baseline tabular feature frame used by the supervised models."""
+    """Create the baseline tabular feature frame used by the supervised models.
+
+    The older notebook flow passed the selected sensor columns through a
+    `columns=` keyword, while the newer generalized notebooks use
+    `measurement_columns=`. Accepting both keeps reruns and partially refreshed
+    kernels from failing when those two versions briefly overlap.
+    """
+    if measurement_columns is None:
+        measurement_columns = columns
+    if measurement_columns is None:
+        raise ValueError("build_model_frame requires measurement_columns or columns.")
+
     model_df = df.copy()
     model_df["issue"] = model_df[target_flag].isin([3, 4, 9]).astype(int)
     model_df["hour_utc"] = model_df["Time UTC"].dt.hour
@@ -468,6 +481,11 @@ def apply_target_strategy(frame: pd.DataFrame, target_flag: str, strategy: str) 
         mapping = {1: 1, 3: 34, 4: 34, 9: 9}
         work["strategy_target"] = work[target_flag].astype(int).map(mapping)
         labels = [1, 34, 9]
+        average = "macro"
+    elif strategy in {"collapsed_12_34_9", "oxygen_collapse_12_34_9"}:
+        mapping = {1: 12, 2: 12, 3: 34, 4: 34, 9: 9}
+        work["strategy_target"] = work[target_flag].astype(int).map(mapping)
+        labels = [12, 34, 9]
         average = "macro"
     elif strategy == "binary_issue":
         work["strategy_target"] = work[target_flag].astype(int).isin([3, 4, 9]).astype(int)
