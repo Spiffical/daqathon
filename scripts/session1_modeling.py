@@ -48,6 +48,9 @@ MEASUREMENT_COLUMNS = [
 
 DEFAULT_CACHE_STEM = "scalar_session1"
 LEGACY_CACHE_STEMS = (DEFAULT_CACHE_STEM, "ctd_session1")
+CACHE_STEM_FALLBACKS = {
+    "conductivity_scalar_session1": ("ctd_session1", DEFAULT_CACHE_STEM),
+}
 
 QC_FLAG_MEANINGS = {
     0: "no QC",
@@ -120,8 +123,10 @@ def resolve_cache_bundle_paths(
     cache_stem: str | None = None,
 ) -> CacheBundlePaths:
     """Resolve an existing bundle, with legacy CTD fallbacks when needed."""
-
-    stems_to_try = [cache_stem] if cache_stem is not None else list(LEGACY_CACHE_STEMS)
+    if cache_stem is None:
+        stems_to_try = list(LEGACY_CACHE_STEMS)
+    else:
+        stems_to_try = [cache_stem, *CACHE_STEM_FALLBACKS.get(cache_stem, ())]
     for stem in stems_to_try:
         candidate = build_cache_bundle_paths(cache_dir, stem)
         if candidate.metadata_path.exists():
