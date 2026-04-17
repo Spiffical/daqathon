@@ -7,6 +7,10 @@ The two main notebooks are:
 - `notebooks/daqathon_session1_supervised_unsupervised_qc.ipynb`
 - `notebooks/daqathon_session1_supervised_unsupervised_qc_tuning.ipynb`
 
+Suggested session flow:
+
+- [Session 1 agenda](./docs/session1_agenda.md)
+
 The first notebook is the main teaching notebook. The second is the advanced notebook for tuning, feature engineering, and deeper model comparisons.
 
 ## Quick Start On FIR
