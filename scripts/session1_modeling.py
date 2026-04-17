@@ -78,6 +78,25 @@ DEFAULT_FLAG_PALETTE = {
     34: "#e76f51",
 }
 
+DEFAULT_GOOD_LABELS = (1,)
+DEFAULT_ISSUE_LABELS = (3, 4, 9)
+
+
+def normalize_label_list(labels: list[int] | tuple[int, ...] | None, default: tuple[int, ...]) -> list[int]:
+    """Normalize an optional label list into a stable integer list."""
+
+    if labels is None:
+        return list(default)
+    return [int(label) for label in dict.fromkeys(labels)]
+
+
+def issue_mask(values: pd.Series, issue_labels: list[int] | tuple[int, ...] | None = None) -> pd.Series:
+    """Return a boolean mask for rows whose labels count as issues."""
+
+    normalized_issue_labels = normalize_label_list(issue_labels, DEFAULT_ISSUE_LABELS)
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.isin(normalized_issue_labels)
+
 
 @dataclass(frozen=True)
 class CacheBundlePaths:
@@ -312,6 +331,7 @@ def load_cache_bundle(
     issue_rows_per_file: int = 12000,
     window_limit: int | None = None,
     target_flag: str = "Conductivity QC Flag",
+    issue_labels: list[int] | tuple[int, ...] | None = None,
     row_columns: list[str] | None = None,
     window_columns: list[str] | None = None,
 ) -> dict[str, object]:
@@ -340,6 +360,7 @@ def load_cache_bundle(
         rows_per_file=rows_per_file,
         issue_rows_per_file=issue_rows_per_file,
         target_flag=target_flag,
+        issue_labels=issue_labels,
         columns=row_columns,
     )
 
@@ -364,6 +385,7 @@ def load_row_level_sample(
     rows_per_file: int | None,
     issue_rows_per_file: int,
     target_flag: str,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Load a row-level sample from each parquet part with optional issue enrichment."""
@@ -377,7 +399,7 @@ def load_row_level_sample(
             base_limit = max(rows_per_file - issue_rows_per_file, 0)
             sampled_frame = evenly_spaced_take(frame, base_limit)
             if issue_rows_per_file > 0 and target_flag in frame.columns:
-                issue_frame = frame[frame[target_flag].fillna(1).astype(int) != 1].reset_index(drop=True)
+                issue_frame = frame[issue_mask(frame[target_flag], issue_labels)].reset_index(drop=True)
                 issue_sample = evenly_spaced_take(issue_frame, issue_rows_per_file)
                 sampled_frame = pd.concat([sampled_frame, issue_sample], ignore_index=True)
                 sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
@@ -402,6 +424,7 @@ def build_model_frame(
     measurement_columns: list[str] | None = None,
     columns: list[str] | None = None,
     task_mode: str,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
     model_row_limit: int | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     """Create the baseline tabular feature frame used by the supervised models.
@@ -417,7 +440,7 @@ def build_model_frame(
         raise ValueError("build_model_frame requires measurement_columns or columns.")
 
     model_df = df.copy()
-    model_df["issue"] = model_df[target_flag].isin([3, 4, 9]).astype(int)
+    model_df["issue"] = issue_mask(model_df[target_flag], issue_labels).astype(int)
     model_df["hour_utc"] = model_df["Time UTC"].dt.hour
     model_df["minute_utc"] = model_df["Time UTC"].dt.minute
     model_df["day_of_year"] = model_df["Time UTC"].dt.dayofyear
@@ -475,10 +498,20 @@ def add_temporal_context_features(
     return work, context_columns
 
 
-def apply_target_strategy(frame: pd.DataFrame, target_flag: str, strategy: str) -> tuple[pd.DataFrame, list[int], str]:
+def apply_target_strategy(
+    frame: pd.DataFrame,
+    target_flag: str,
+    strategy: str,
+    *,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+) -> tuple[pd.DataFrame, list[int], str]:
     """Map raw QC flags into one of the teaching target strategies."""
     work = frame.copy()
-    if strategy == "multiclass_1_3_4_9":
+    if strategy == "raw_multiclass":
+        work["strategy_target"] = work[target_flag].astype(int)
+        labels = sorted(work["strategy_target"].dropna().astype(int).unique().tolist())
+        average = "macro"
+    elif strategy == "multiclass_1_3_4_9":
         work["strategy_target"] = work[target_flag].astype(int)
         labels = [1, 3, 4, 9]
         average = "macro"
@@ -493,7 +526,7 @@ def apply_target_strategy(frame: pd.DataFrame, target_flag: str, strategy: str) 
         labels = [12, 34, 9]
         average = "macro"
     elif strategy == "binary_issue":
-        work["strategy_target"] = work[target_flag].astype(int).isin([3, 4, 9]).astype(int)
+        work["strategy_target"] = issue_mask(work[target_flag], issue_labels).astype(int)
         labels = [0, 1]
         average = "binary"
     else:
@@ -662,8 +695,14 @@ def _flag_span_boundaries(panel: pd.DataFrame, start_index: int, stop_index: int
     return _span_boundaries(panel["Time UTC"], start_index, stop_index)
 
 
-def _iter_flag_spans(panel: pd.DataFrame, target_flag: str) -> list[tuple[int, pd.Timestamp, pd.Timestamp]]:
+def _iter_flag_spans(
+    panel: pd.DataFrame,
+    target_flag: str,
+    *,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+) -> list[tuple[int, pd.Timestamp, pd.Timestamp]]:
     """Return contiguous non-good QC regions as (flag, span_start, span_end)."""
+    normalized_good_labels = set(normalize_label_list(good_labels, DEFAULT_GOOD_LABELS))
     flag_values = panel[target_flag].copy()
     if pd.api.types.is_numeric_dtype(flag_values):
         flag_values = flag_values.fillna(9).astype(int)
@@ -677,7 +716,7 @@ def _iter_flag_spans(panel: pd.DataFrame, target_flag: str) -> list[tuple[int, p
         reached_end = index == len(panel)
         if reached_end or flag_values.iloc[index] != flag_values.iloc[run_start]:
             run_flag = int(flag_values.iloc[run_start])
-            if run_flag != 1:
+            if run_flag not in normalized_good_labels:
                 span_start, span_end = _flag_span_boundaries(panel, run_start, index - 1)
                 spans.append((run_flag, span_start, span_end))
             run_start = index
@@ -1290,6 +1329,7 @@ def plot_flag_examples(
     secondary_column: str = "Temperature (C)",
     points_per_panel: int = 300,
     classes: tuple[int, ...] = (1, 3, 4, 9),
+    good_labels: list[int] | tuple[int, ...] | None = None,
     region_alpha: float = 0.18,
     show_flag_points: bool = True,
 ) -> tuple[plt.Figure, pd.DataFrame]:
@@ -1311,7 +1351,8 @@ def plot_flag_examples(
         axes = [axes]
 
     example_rows = []
-    colors = {1: "#1f77b4", 3: "#ff7f0e", 4: "#d62728", 9: "#7f7f7f"}
+    normalized_good_labels = set(normalize_label_list(good_labels, DEFAULT_GOOD_LABELS))
+    colors = dict(DEFAULT_FLAG_PALETTE)
     line_color = "#0f172a"
     temp_color = "#059669"
     for axis, flag in zip(axes, available_classes):
@@ -1338,7 +1379,7 @@ def plot_flag_examples(
             start = max(center_index - points_per_panel // 2, 0)
             stop = min(start + points_per_panel, len(work))
             panel = work.iloc[start:stop].copy()
-        panel_spans = _iter_flag_spans(panel, target_flag)
+        panel_spans = _iter_flag_spans(panel, target_flag, good_labels=good_labels)
         flags_in_panel = sorted({span_flag for span_flag, _, _ in panel_spans})
 
         # Shade all non-good QC spans so participants can see the local context
@@ -1354,7 +1395,7 @@ def plot_flag_examples(
             )
 
         axis.plot(panel["Time UTC"], panel[measurement_column], color=line_color, linewidth=1.8, label=measurement_column)
-        if show_flag_points and flag != 1:
+        if show_flag_points and flag not in normalized_good_labels:
             target_points = panel.loc[panel[target_flag].fillna(-1).astype(int) == flag, ["Time UTC", measurement_column]]
             target_points = target_points.dropna(subset=[measurement_column])
             if not target_points.empty:
@@ -1379,7 +1420,7 @@ def plot_flag_examples(
             Line2D([0], [0], color=line_color, linewidth=2, label=measurement_column),
             Line2D([0], [0], color=temp_color, linewidth=2, label=secondary_column),
         ]
-        if show_flag_points and flag != 1:
+        if show_flag_points and flag not in normalized_good_labels:
             legend_handles.append(
                 Line2D(
                     [0],
@@ -1428,6 +1469,7 @@ def plot_cluster_window_examples(
     measurement_column: str = "Conductivity (S/m)",
     secondary_column: str = "Temperature (C)",
     target_flag: str = "Conductivity QC Flag",
+    good_labels: list[int] | tuple[int, ...] | None = None,
     examples_per_cluster: int = 1,
     context_points: int = 1500,
     highlight_alpha: float = 0.22,
@@ -1491,7 +1533,7 @@ def plot_cluster_window_examples(
 
         cluster_id = int(row["cluster"])
         cluster_color = cluster_palette[cluster_id]
-        flag_spans = _iter_flag_spans(context_panel, target_flag)
+        flag_spans = _iter_flag_spans(context_panel, target_flag, good_labels=good_labels)
 
         shown_flag_labels: set[int] = set()
         for flag_value, span_start, span_end in flag_spans:
@@ -1698,10 +1740,11 @@ def fit_kmeans(
 
 def reduce_window_target(values: np.ndarray, mode: str, severity_order: tuple[int, ...] = (1, 3, 4, 9)) -> int:
     """Reduce row labels inside one window to a single label for window models."""
-    severity_rank = {label: index for index, label in enumerate(severity_order)}
     labels = [int(value) for value in values if pd.notna(value)]
     if not labels:
         return severity_order[0]
+    effective_order = tuple(sorted(set(severity_order).union(labels)))
+    severity_rank = {label: index for index, label in enumerate(effective_order)}
     if mode == "worst":
         return max(labels, key=lambda label: severity_rank.get(label, -1))
     counts = pd.Series(labels).value_counts()

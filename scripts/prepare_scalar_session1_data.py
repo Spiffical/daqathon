@@ -22,6 +22,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -32,9 +33,10 @@ DEVICE_PATTERNS = {
     "oxygen": "OxygenSensor",
 }
 
-FILENAME_TIME_RANGE_RE = re.compile(r"_(\d{8}T\d{6}Z)_(\d{8}T\d{6}Z)-NaN\.csv$")
+FILENAME_TIME_RANGE_RE = re.compile(r"_(\d{8}T\d{6}(?:\.\d+)?Z)_(\d{8}T\d{6}(?:\.\d+)?Z)(?:-NaN)?\.csv$")
 
 DEFAULT_CACHE_STEM = "scalar_session1"
+DEFAULT_ISSUE_LABELS = [3, 4, 9]
 
 DEFAULT_MEASUREMENT_COLUMNS = [
     "Conductivity (S/m)",
@@ -166,7 +168,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--primary-device",
         default="ctd",
-        choices=sorted(DEVICE_PATTERNS),
+        choices=sorted([*DEVICE_PATTERNS, "other"]),
         help="Device family that provides the main time base and target flag.",
     )
     parser.add_argument(
@@ -177,6 +179,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-rows", type=int, default=None)
     parser.add_argument("--window-size", type=int, default=256)
+    parser.add_argument(
+        "--issue-label",
+        dest="issue_labels",
+        action="append",
+        type=int,
+        default=None,
+        help="Repeatable issue-label override used for issue summaries. Defaults to 3, 4, and 9.",
+    )
     parser.add_argument(
         "--measurement-column",
         dest="measurement_columns",
@@ -205,7 +215,7 @@ def clean_header_value(value: str) -> str:
     if cleaned.startswith("#"):
         cleaned = cleaned[1:]
     cleaned = cleaned.strip().strip('"')
-    if cleaned.startswith("Time UTC"):
+    if cleaned.startswith("Time UTC") or cleaned in {"sampleTime", "sample_time"}:
         return "Time UTC"
     return cleaned
 
@@ -226,8 +236,9 @@ def locate_header(path: Path) -> tuple[int, list[str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
         for line_number, row in enumerate(reader, start=1):
-            if row and "Time UTC" in row[0]:
-                return line_number, [clean_header_value(value) for value in row]
+            cleaned_row = [clean_header_value(value) for value in row]
+            if cleaned_row and "Time UTC" in cleaned_row:
+                return line_number, cleaned_row
     raise ValueError(f"Could not locate the tabular header in {path}")
 
 
@@ -301,8 +312,8 @@ def parse_file_info(path: Path) -> CsvFileInfo:
         series_key = path.stem
 
     if match:
-        start_time = pd.to_datetime(match.group(1), utc=True, format="%Y%m%dT%H%M%SZ")
-        end_time = pd.to_datetime(match.group(2), utc=True, format="%Y%m%dT%H%M%SZ")
+        start_time = parse_filename_timestamp(match.group(1))
+        end_time = parse_filename_timestamp(match.group(2))
     else:
         start_time = None
         end_time = None
@@ -334,6 +345,24 @@ def discover_available_columns(csv_paths: list[Path]) -> list[str]:
                 seen.add(column)
                 column_order.append(column)
     return column_order
+
+
+def is_qc_like_column(column: str) -> bool:
+    """Return whether a column looks like a QC or label bookkeeping field."""
+
+    lowered = column.lower()
+    return column.endswith("QC Flag") or "_qaqc_" in lowered or lowered.endswith("_qaqc")
+
+
+def parse_filename_timestamp(value: str) -> pd.Timestamp:
+    """Parse one compact timestamp token extracted from a CSV filename."""
+
+    for time_format in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S.%fZ"):
+        try:
+            return pd.Timestamp(datetime.strptime(value, time_format), tz="UTC")
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported filename timestamp format: {value}")
 
 
 def read_scalar_csv(
@@ -408,7 +437,7 @@ def choose_measurement_columns(
     from a preferred ordering and then append any remaining numeric columns.
     """
 
-    qc_columns = {column for column in columns if column.endswith("QC Flag")}
+    qc_columns = {column for column in columns if is_qc_like_column(column)}
     excluded = {"Time UTC", "source_file", *qc_columns}
 
     if requested_measurement_columns:
@@ -428,6 +457,7 @@ def build_window_features(
     target_flag: str,
     window_size: int,
     measurement_columns: list[str],
+    issue_labels: list[int],
 ) -> pd.DataFrame:
     """Summarize contiguous row windows into one feature row per window.
 
@@ -451,8 +481,8 @@ def build_window_features(
         "window_end": ("Time UTC", "max"),
         "source_file": ("source_file", "first"),
         "row_count": ("Time UTC", "size"),
-        "issue_count": (target_flag, lambda values: int(values.isin([3, 4, 9]).sum())),
-        "issue_rate": (target_flag, lambda values: float(values.isin([3, 4, 9]).mean())),
+        "issue_count": (target_flag, lambda values: int(values.isin(issue_labels).sum())),
+        "issue_rate": (target_flag, lambda values: float(values.isin(issue_labels).mean())),
         "target_mode": (
             target_flag,
             lambda values: int(values.mode(dropna=True).iloc[0])
@@ -678,8 +708,9 @@ def main() -> None:
     bundle_paths.row_level_dir.mkdir(parents=True, exist_ok=True)
 
     merge_tolerance = pd.Timedelta(seconds=args.merge_tolerance_seconds)
+    issue_labels = sorted(dict.fromkeys(args.issue_labels or DEFAULT_ISSUE_LABELS))
     all_columns = simulate_merged_columns(selected_infos, primary_device=args.primary_device)
-    qc_columns = [column for column in all_columns if column.endswith("QC Flag")]
+    qc_columns = [column for column in all_columns if is_qc_like_column(column)]
 
     if args.target_flag not in all_columns:
         raise SystemExit(f"Target flag '{args.target_flag}' not found after merge")
@@ -688,6 +719,7 @@ def main() -> None:
         all_columns,
         requested_measurement_columns=requested_measurement_columns,
     )
+    measurement_columns = [column for column in measurement_columns if column != args.target_flag]
     missing_measurement_columns = [
         column
         for column in (requested_measurement_columns or [])
@@ -751,6 +783,7 @@ def main() -> None:
                 target_flag=args.target_flag,
                 window_size=args.window_size,
                 measurement_columns=measurement_columns,
+                issue_labels=issue_labels,
             )
         )
 
@@ -788,9 +821,10 @@ def main() -> None:
         "window_count": int(len(window_frame)),
         "sample_rows_per_file": args.sample_rows,
         "window_size": args.window_size,
+        "issue_labels": issue_labels,
         "target_distribution": {str(key): int(value) for key, value in sorted(target_counts.items())},
         "issue_fraction": (
-            float(sum(target_counts.get(flag, 0) for flag in (3, 4, 9)) / total_rows)
+            float(sum(target_counts.get(flag, 0) for flag in issue_labels) / total_rows)
             if total_rows
             else 0.0
         ),
