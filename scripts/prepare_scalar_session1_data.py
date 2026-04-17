@@ -578,6 +578,45 @@ def select_time_aligned_paths(
     return limited
 
 
+def simulate_merged_columns(
+    selected_infos: dict[str, list[CsvFileInfo]],
+    *,
+    primary_device: str,
+) -> list[str]:
+    """Predict the merged row-level column order for the selected file bundle.
+
+    The full preparation pass writes one merged parquet part per primary file.
+    To keep memory use low we no longer concatenate the full dataset before
+    writing, but the notebooks still benefit from stable row-column metadata.
+    This helper builds that expected merged schema from CSV headers alone by
+    replaying the same secondary-device merge order and rename rules used in
+    ``main()``.
+    """
+
+    merged_columns = ["Time UTC"]
+
+    primary_paths = [info.path for info in selected_infos.get(primary_device, [])]
+    for column in discover_available_columns(primary_paths):
+        if column not in merged_columns:
+            merged_columns.append(column)
+    if "source_file" not in merged_columns:
+        merged_columns.append("source_file")
+
+    secondary_devices = [device for device in ("ctd", "fluorometer", "oxygen", "other") if device != primary_device]
+    for device_name in secondary_devices:
+        device_paths = [info.path for info in selected_infos.get(device_name, [])]
+        if not device_paths:
+            continue
+        for column in discover_available_columns(device_paths):
+            if column in {"Time UTC", "source_file"}:
+                continue
+            merged_name = f"{column} [{device_name}]" if column in merged_columns else column
+            if merged_name not in merged_columns:
+                merged_columns.append(merged_name)
+
+    return merged_columns
+
+
 def main() -> None:
     """Run the full scalar cache-preparation pipeline.
 
@@ -623,8 +662,13 @@ def main() -> None:
         primary_device=args.primary_device,
         max_files=args.max_files,
     )
-    primary_paths = limited_paths.get(args.primary_device, [])
-    if not primary_paths:
+    selected_infos = {
+        device: [info for info in infos if info.path in set(limited_paths.get(device, []))]
+        for device, infos in grouped_infos.items()
+    }
+
+    primary_infos = selected_infos.get(args.primary_device, [])
+    if not primary_infos:
         raise SystemExit(
             f"Expected at least one {args.primary_device!r} file based on --primary-device"
         )
@@ -633,50 +677,11 @@ def main() -> None:
     clear_old_outputs(bundle_paths)
     bundle_paths.row_level_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read the primary device first. This frame defines the main time base and
-    # carries the target QC flag we will model later.
-    primary_parts = [read_scalar_csv(path, args.sample_rows) for path in primary_paths]
-    primary_frame = pd.concat(primary_parts, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
-
-    merged = primary_frame.copy()
     merge_tolerance = pd.Timedelta(seconds=args.merge_tolerance_seconds)
-
-    # Merge each secondary stream onto the primary timestamps using nearest-time
-    # alignment within a controlled tolerance. This gives us extra context
-    # columns without changing the fundamental "one primary row per timestamp"
-    # structure of the dataset.
-    secondary_devices = [device for device in ("ctd", "fluorometer", "oxygen", "other") if device != args.primary_device]
-    for device_name in secondary_devices:
-        device_paths = limited_paths.get(device_name, [])
-        if not device_paths:
-            continue
-
-        secondary_parts = [read_scalar_csv(path, args.sample_rows) for path in device_paths]
-        secondary = pd.concat(secondary_parts, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
-
-        rename_map = {}
-        for column in secondary.columns:
-            if column in {"Time UTC", "source_file"}:
-                continue
-            if column in merged.columns:
-                rename_map[column] = f"{column} [{device_name}]"
-        if rename_map:
-            secondary = secondary.rename(columns=rename_map)
-
-        secondary = secondary.drop(columns=["source_file"], errors="ignore")
-        merged = pd.merge_asof(
-            merged.sort_values("Time UTC"),
-            secondary.sort_values("Time UTC"),
-            on="Time UTC",
-            direction="nearest",
-            tolerance=merge_tolerance,
-        )
-
-    merged = merged.sort_values("Time UTC").reset_index(drop=True)
-    all_columns = merged.columns.tolist()
+    all_columns = simulate_merged_columns(selected_infos, primary_device=args.primary_device)
     qc_columns = [column for column in all_columns if column.endswith("QC Flag")]
 
-    if args.target_flag not in merged.columns:
+    if args.target_flag not in all_columns:
         raise SystemExit(f"Target flag '{args.target_flag}' not found after merge")
 
     measurement_columns = choose_measurement_columns(
@@ -689,38 +694,79 @@ def main() -> None:
         if column not in measurement_columns
     ]
 
-    total_rows = len(merged)
-    target_counts = Counter(merged[args.target_flag].dropna().astype(int).tolist())
-
+    secondary_devices = [device for device in ("ctd", "fluorometer", "oxygen", "other") if device != args.primary_device]
+    total_rows = 0
+    target_counts: Counter[int] = Counter()
     processed_files: list[dict[str, object]] = []
     window_frames: list[pd.DataFrame] = []
-    # Write one parquet part per source file so later notebook code can inspect,
-    # sample, or stage the cache incrementally instead of requiring one huge
-    # monolithic table.
-    for index, (source_file, source_frame) in enumerate(merged.groupby("source_file", sort=True), start=1):
-        source_frame = source_frame.sort_values("Time UTC").reset_index(drop=True)
+
+    # Process one aligned primary file at a time. This keeps peak memory use
+    # close to "one primary chunk plus a few companion chunks" instead of the
+    # full merged dataset across all files.
+    for index, primary_info in enumerate(primary_infos, start=1):
+        merged = read_scalar_csv(primary_info.path, args.sample_rows).sort_values("Time UTC").reset_index(drop=True)
+
+        # Merge each secondary stream onto the primary timestamps using
+        # nearest-time alignment within a controlled tolerance.
+        for device_name in secondary_devices:
+            device_infos = selected_infos.get(device_name, [])
+            if not device_infos:
+                continue
+
+            companion_info = _choose_best_companion(primary_info, device_infos)
+            if companion_info is None:
+                continue
+
+            secondary = read_scalar_csv(companion_info.path, args.sample_rows).sort_values("Time UTC").reset_index(drop=True)
+            rename_map = {}
+            for column in secondary.columns:
+                if column in {"Time UTC", "source_file"}:
+                    continue
+                if column in merged.columns:
+                    rename_map[column] = f"{column} [{device_name}]"
+            if rename_map:
+                secondary = secondary.rename(columns=rename_map)
+
+            secondary = secondary.drop(columns=["source_file"], errors="ignore")
+            merged = pd.merge_asof(
+                merged.sort_values("Time UTC"),
+                secondary.sort_values("Time UTC"),
+                on="Time UTC",
+                direction="nearest",
+                tolerance=merge_tolerance,
+            )
+
+        merged = merged.sort_values("Time UTC").reset_index(drop=True)
+        for column in all_columns:
+            if column not in merged.columns:
+                merged[column] = pd.NA
+        merged = merged[[column for column in all_columns if column in merged.columns]]
+
         part_path = bundle_paths.row_level_dir / f"part-{index:03d}.parquet"
-        source_frame.to_parquet(part_path, index=False)
+        merged.to_parquet(part_path, index=False)
 
         window_frames.append(
             build_window_features(
-                source_frame,
+                merged,
                 target_flag=args.target_flag,
                 window_size=args.window_size,
                 measurement_columns=measurement_columns,
             )
         )
 
+        total_rows += len(merged)
+        target_counts.update(merged[args.target_flag].dropna().astype(int).tolist())
+
         processed_files.append(
             {
-                "source_file": source_file,
-                "row_count": int(len(source_frame)),
-                "time_start": source_frame["Time UTC"].min().isoformat() if not source_frame.empty else None,
-                "time_end": source_frame["Time UTC"].max().isoformat() if not source_frame.empty else None,
+                "source_file": primary_info.path.name,
+                "row_count": int(len(merged)),
+                "time_start": merged["Time UTC"].min().isoformat() if not merged.empty else None,
+                "time_end": merged["Time UTC"].max().isoformat() if not merged.empty else None,
                 "row_level_part": str(part_path),
             }
         )
-        print(f"[{index}] wrote {part_path} with {len(source_frame):,} rows")
+        print(f"[{index}] wrote {part_path} with {len(merged):,} rows")
 
     window_frame = pd.concat(window_frames, ignore_index=True)
     window_frame.to_parquet(bundle_paths.window_cache_path, index=False)
