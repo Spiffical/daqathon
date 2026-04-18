@@ -15,6 +15,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from sklearn.cluster import KMeans
@@ -80,6 +81,11 @@ DEFAULT_FLAG_PALETTE = {
 
 DEFAULT_GOOD_LABELS = (1,)
 DEFAULT_ISSUE_LABELS = (3, 4, 9)
+SUPPORTED_SPLIT_STRATEGIES = (
+    "global_contiguous",
+    "per_source_contiguous",
+    "interleaved_blocks",
+)
 
 
 def normalize_label_list(labels: list[int] | tuple[int, ...] | None, default: tuple[int, ...]) -> list[int]:
@@ -415,6 +421,273 @@ def build_distribution_frame(metadata: dict[str, object], df: pd.DataFrame, targ
     ).sort_index()
     sample_target_counts = df[target_flag].dropna().astype(int).value_counts().sort_index()
     return pd.DataFrame({"full_cache": full_target_counts, "loaded_sample": sample_target_counts}).fillna(0).astype(int)
+
+
+def summarize_split_distributions(
+    split_frames: dict[str, pd.DataFrame],
+    *,
+    label_column: str = "model_target",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return per-split label counts and normalized shares for a split dictionary."""
+
+    count_frame = pd.DataFrame(
+        {
+            split_name: frame[label_column].value_counts().sort_index()
+            for split_name, frame in split_frames.items()
+        }
+    ).fillna(0).astype(int)
+    share_frame = count_frame.div(count_frame.sum(axis=0), axis=1).fillna(0.0)
+    return count_frame, share_frame
+
+
+def compute_split_share_gap(share_frame: pd.DataFrame) -> dict[str, float]:
+    """Summarize how different the split label compositions are from one another.
+
+    The metric is the total variation distance between two split-share vectors,
+    averaged and maximized over every split pair. A value of ``0`` means the
+    splits have identical composition; larger values mean stronger drift.
+    """
+
+    split_names = list(share_frame.columns)
+    pairwise_gaps: list[float] = []
+    for index, left_name in enumerate(split_names):
+        for right_name in split_names[index + 1 :]:
+            left = share_frame[left_name].reindex(share_frame.index, fill_value=0.0)
+            right = share_frame[right_name].reindex(share_frame.index, fill_value=0.0)
+            pairwise_gaps.append(float(np.abs(left - right).sum() / 2.0))
+
+    if not pairwise_gaps:
+        return {"max_pairwise_total_variation": 0.0, "mean_pairwise_total_variation": 0.0}
+    return {
+        "max_pairwise_total_variation": float(max(pairwise_gaps)),
+        "mean_pairwise_total_variation": float(np.mean(pairwise_gaps)),
+    }
+
+
+def _split_slot_name(
+    block_index: int,
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+    cycle_length: int = 20,
+) -> str:
+    """Map one repeating block index onto a train/validation/test slot."""
+
+    if cycle_length < 3:
+        raise ValueError("cycle_length must be at least 3")
+
+    train_slots = min(max(int(round(cycle_length * train_fraction)), 1), cycle_length - 2)
+    validation_slots = min(max(int(round(cycle_length * validation_fraction)), 1), cycle_length - train_slots - 1)
+    slot = int(block_index % cycle_length)
+    if slot < train_slots:
+        return "train"
+    if slot < train_slots + validation_slots:
+        return "validation"
+    return "test"
+
+
+def _finalize_split_frames(
+    split_frames: dict[str, list[pd.DataFrame]],
+    *,
+    template_frame: pd.DataFrame,
+    time_column: str,
+) -> dict[str, pd.DataFrame]:
+    """Concatenate per-split frame lists and keep a stable split dictionary."""
+
+    empty_template = template_frame.iloc[0:0].copy()
+    finalized: dict[str, pd.DataFrame] = {}
+    for split_name in ("train", "validation", "test"):
+        parts = split_frames.get(split_name, [])
+        if parts:
+            split_frame = pd.concat(parts, ignore_index=True)
+            if time_column in split_frame.columns:
+                split_frame = split_frame.sort_values(time_column)
+            finalized[split_name] = split_frame.reset_index(drop=True)
+        else:
+            finalized[split_name] = empty_template.copy()
+    return finalized
+
+
+def split_frame_by_strategy(
+    frame: pd.DataFrame,
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+    strategy: str = "global_contiguous",
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+    block_rows: int = 1024,
+    block_cycle_length: int = 20,
+) -> dict[str, pd.DataFrame]:
+    """Split a time-ordered dataframe with one of the notebook split strategies.
+
+    Supported strategies:
+
+    - ``global_contiguous``: one early/middle/late cut across the entire frame.
+    - ``per_source_contiguous``: make an early/middle/late cut inside each source
+      file, then concatenate the per-file train/validation/test slices.
+    - ``interleaved_blocks``: keep short local time blocks intact, but distribute
+      them across train/validation/test in a repeating schedule so each split sees
+      more of the deployment's operating regimes.
+    """
+
+    if strategy not in SUPPORTED_SPLIT_STRATEGIES:
+        raise ValueError(f"Unsupported split strategy: {strategy}")
+    if block_rows <= 0:
+        raise ValueError("block_rows must be positive")
+
+    if time_column in frame.columns:
+        ordered = frame.sort_values(time_column).reset_index(drop=True).copy()
+    else:
+        ordered = frame.reset_index(drop=True).copy()
+
+    if strategy == "global_contiguous" or source_column not in ordered.columns:
+        train_frame, valid_frame, test_frame = contiguous_split(
+            ordered,
+            train_fraction=train_fraction,
+            validation_fraction=validation_fraction,
+        )
+        return {"train": train_frame, "validation": valid_frame, "test": test_frame}
+
+    split_frames: dict[str, list[pd.DataFrame]] = {"train": [], "validation": [], "test": []}
+
+    if strategy == "per_source_contiguous":
+        for _, source_frame in ordered.groupby(source_column, sort=False):
+            local_train, local_valid, local_test = contiguous_split(
+                source_frame.reset_index(drop=True),
+                train_fraction=train_fraction,
+                validation_fraction=validation_fraction,
+            )
+            split_frames["train"].append(local_train)
+            split_frames["validation"].append(local_valid)
+            split_frames["test"].append(local_test)
+        return _finalize_split_frames(split_frames, template_frame=ordered, time_column=time_column)
+
+    global_block_index = 0
+    for _, source_frame in ordered.groupby(source_column, sort=False):
+        source_frame = source_frame.reset_index(drop=True)
+        for start in range(0, len(source_frame), block_rows):
+            block = source_frame.iloc[start : start + block_rows].copy()
+            if block.empty:
+                continue
+            split_name = _split_slot_name(
+                global_block_index,
+                train_fraction=train_fraction,
+                validation_fraction=validation_fraction,
+                cycle_length=block_cycle_length,
+            )
+            split_frames[split_name].append(block)
+            global_block_index += 1
+    return _finalize_split_frames(split_frames, template_frame=ordered, time_column=time_column)
+
+
+def scan_interleaved_block_rows(
+    frame: pd.DataFrame,
+    *,
+    label_column: str,
+    train_fraction: float,
+    validation_fraction: float,
+    candidate_block_rows: tuple[int, ...] = (512, 1024, 2048, 4096),
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> pd.DataFrame:
+    """Compare several interleaved-block sizes and summarize split balance."""
+
+    rows = []
+    for block_rows in candidate_block_rows:
+        split_frames = split_frame_by_strategy(
+            frame,
+            train_fraction=train_fraction,
+            validation_fraction=validation_fraction,
+            strategy="interleaved_blocks",
+            time_column=time_column,
+            source_column=source_column,
+            block_rows=block_rows,
+        )
+        split_counts, split_shares = summarize_split_distributions(split_frames, label_column=label_column)
+        rows.append(
+            {
+                "block_rows": int(block_rows),
+                **compute_split_share_gap(split_shares),
+                "train_rows": int(split_counts["train"].sum()),
+                "validation_rows": int(split_counts["validation"].sum()),
+                "test_rows": int(split_counts["test"].sum()),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        ["max_pairwise_total_variation", "mean_pairwise_total_variation", "block_rows"]
+    ).reset_index(drop=True)
+
+
+def compute_contiguous_split_target_distribution(
+    part_paths: list[str | Path],
+    *,
+    target_flag: str,
+    train_fraction: float,
+    validation_fraction: float,
+    labels: list[int] | None = None,
+    part_row_counts: list[int] | None = None,
+    batch_size: int = 250_000,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute full-cache target balance for a contiguous time split without loading all rows.
+
+    This helper scans only the target column from each parquet part, preserving
+    time order across parts. That lets the notebook compare the *true* full-cache
+    contiguous split with whatever smaller sampled dataframe is loaded later.
+    """
+
+    ordered_paths = [Path(path) for path in part_paths]
+    if part_row_counts is None:
+        part_row_counts = [pq.ParquetFile(path).metadata.num_rows for path in ordered_paths]
+
+    total_rows = int(sum(part_row_counts))
+    train_cut = int(total_rows * train_fraction)
+    validation_cut = int(total_rows * (train_fraction + validation_fraction))
+
+    split_order = ("train", "validation", "test")
+    split_counts: dict[str, dict[int, int]] = {split_name: {} for split_name in split_order}
+    global_row_offset = 0
+
+    def add_segment_counts(split_name: str, values: pd.Series) -> None:
+        if values.empty:
+            return
+        for label, count in values.astype(int).value_counts().items():
+            split_counts[split_name][int(label)] = split_counts[split_name].get(int(label), 0) + int(count)
+
+    for path in ordered_paths:
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches(columns=[target_flag], batch_size=batch_size):
+            numeric = pd.to_numeric(batch.column(0).to_pandas(), errors="coerce")
+            batch_length = len(numeric)
+            batch_start = global_row_offset
+            batch_end = global_row_offset + batch_length
+
+            segments = [
+                ("train", batch_start, min(batch_end, train_cut)),
+                ("validation", max(batch_start, train_cut), min(batch_end, validation_cut)),
+                ("test", max(batch_start, validation_cut), batch_end),
+            ]
+            for split_name, segment_start, segment_end in segments:
+                if segment_end <= segment_start:
+                    continue
+                local_start = segment_start - batch_start
+                local_end = segment_end - batch_start
+                segment = numeric.iloc[local_start:local_end].dropna()
+                add_segment_counts(split_name, segment)
+
+            global_row_offset = batch_end
+
+    if labels is None:
+        labels = sorted({label for counts in split_counts.values() for label in counts})
+
+    count_frame = pd.DataFrame(
+        {
+            split_name: pd.Series(split_counts[split_name], dtype="int64")
+            for split_name in split_order
+        }
+    ).reindex(labels, fill_value=0).fillna(0).astype(int)
+    share_frame = count_frame.div(count_frame.sum(axis=0), axis=1).fillna(0.0)
+    return count_frame, share_frame
 
 
 def build_model_frame(
@@ -1766,6 +2039,183 @@ class CnnDataBundle:
     feature_columns: list[str]
 
 
+@dataclass
+class SequenceSplitBundle:
+    """Raw sequence splits before model-specific layout or normalization."""
+
+    X_train: np.ndarray
+    X_valid: np.ndarray
+    X_test: np.ndarray
+    y_train: np.ndarray
+    y_valid: np.ndarray
+    y_test: np.ndarray
+    class_labels: list[int]
+    window_size: int
+    feature_columns: list[str]
+    output_mode: str
+
+
+def _frame_to_fixed_windows(
+    frame: pd.DataFrame,
+    *,
+    measurement_columns: list[str],
+    target_column: str,
+    window_size: int,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Turn one split frame into fixed windows without crossing source boundaries."""
+
+    required_columns = [*measurement_columns, target_column]
+    if time_column in frame.columns:
+        required_columns.append(time_column)
+    if source_column in frame.columns:
+        required_columns.append(source_column)
+
+    window_frame = frame[required_columns].copy().dropna().reset_index(drop=True)
+    if window_frame.empty:
+        return (
+            np.empty((0, window_size, len(measurement_columns)), dtype=np.float32),
+            np.empty((0, window_size), dtype=np.int64),
+        )
+
+    if source_column in window_frame.columns:
+        grouped_frames = (group.reset_index(drop=True) for _, group in window_frame.groupby(source_column, sort=False))
+    else:
+        grouped_frames = (window_frame.reset_index(drop=True),)
+
+    raw_sequences: list[np.ndarray] = []
+    raw_targets: list[np.ndarray] = []
+    for source_frame in grouped_frames:
+        if time_column in source_frame.columns:
+            source_frame = source_frame.sort_values(time_column).reset_index(drop=True)
+        usable_rows = (len(source_frame) // window_size) * window_size
+        if usable_rows < window_size:
+            continue
+        trimmed = source_frame.iloc[:usable_rows]
+        raw_sequences.append(
+            trimmed[measurement_columns].to_numpy(dtype=np.float32).reshape(-1, window_size, len(measurement_columns))
+        )
+        raw_targets.append(trimmed[target_column].to_numpy().reshape(-1, window_size))
+
+    if not raw_sequences:
+        return (
+            np.empty((0, window_size, len(measurement_columns)), dtype=np.float32),
+            np.empty((0, window_size), dtype=np.int64),
+        )
+    return np.concatenate(raw_sequences, axis=0), np.concatenate(raw_targets, axis=0)
+
+
+def build_sequence_split_bundle(
+    model_df: pd.DataFrame,
+    *,
+    measurement_columns: list[str],
+    target_column: str,
+    task_mode: str,
+    output_mode: str,
+    window_size: int,
+    train_fraction: float,
+    validation_fraction: float,
+    label_reduction: str,
+    split_strategy: str = "global_contiguous",
+    split_block_rows: int = 1024,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> SequenceSplitBundle:
+    """Build raw fixed-window splits for CNN/transformer experiments.
+
+    The split strategy is applied to the row-level dataframe first, and only then
+    is each split converted into fixed windows. That prevents windows from
+    crossing split boundaries and lets every model section share the same split
+    logic.
+    """
+
+    split_frames = split_frame_by_strategy(
+        model_df,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+        strategy=split_strategy,
+        time_column=time_column,
+        source_column=source_column,
+        block_rows=split_block_rows,
+    )
+
+    raw_train, train_targets = _frame_to_fixed_windows(
+        split_frames["train"],
+        measurement_columns=measurement_columns,
+        target_column=target_column,
+        window_size=window_size,
+        time_column=time_column,
+        source_column=source_column,
+    )
+    raw_valid, valid_targets = _frame_to_fixed_windows(
+        split_frames["validation"],
+        measurement_columns=measurement_columns,
+        target_column=target_column,
+        window_size=window_size,
+        time_column=time_column,
+        source_column=source_column,
+    )
+    raw_test, test_targets = _frame_to_fixed_windows(
+        split_frames["test"],
+        measurement_columns=measurement_columns,
+        target_column=target_column,
+        window_size=window_size,
+        time_column=time_column,
+        source_column=source_column,
+    )
+
+    if task_mode == "multiclass":
+        if output_mode == "window":
+            train_labels = np.array([reduce_window_target(row, mode=label_reduction) for row in train_targets], dtype=np.int64)
+            valid_labels = np.array([reduce_window_target(row, mode=label_reduction) for row in valid_targets], dtype=np.int64)
+            test_labels = np.array([reduce_window_target(row, mode=label_reduction) for row in test_targets], dtype=np.int64)
+        else:
+            train_labels = train_targets.astype(np.int64)
+            valid_labels = valid_targets.astype(np.int64)
+            test_labels = test_targets.astype(np.int64)
+
+        active_values: list[int] = []
+        for values in (train_labels, valid_labels, test_labels):
+            if values.size:
+                active_values.extend(np.asarray(values).reshape(-1).tolist())
+        class_labels = sorted({int(value) for value in active_values})
+        label_to_index = {label: index for index, label in enumerate(class_labels)}
+
+        if output_mode == "window":
+            y_train = np.array([label_to_index[label] for label in train_labels], dtype=np.int64) if len(train_labels) else np.array([], dtype=np.int64)
+            y_valid = np.array([label_to_index[label] for label in valid_labels], dtype=np.int64) if len(valid_labels) else np.array([], dtype=np.int64)
+            y_test = np.array([label_to_index[label] for label in test_labels], dtype=np.int64) if len(test_labels) else np.array([], dtype=np.int64)
+        else:
+            vectorize = np.vectorize(label_to_index.get)
+            y_train = vectorize(train_labels).astype(np.int64) if train_labels.size else np.empty((0, window_size), dtype=np.int64)
+            y_valid = vectorize(valid_labels).astype(np.int64) if valid_labels.size else np.empty((0, window_size), dtype=np.int64)
+            y_test = vectorize(test_labels).astype(np.int64) if test_labels.size else np.empty((0, window_size), dtype=np.int64)
+    else:
+        class_labels = [0, 1]
+        if output_mode == "window":
+            y_train = train_targets.max(axis=1).astype(np.float32) if len(train_targets) else np.array([], dtype=np.float32)
+            y_valid = valid_targets.max(axis=1).astype(np.float32) if len(valid_targets) else np.array([], dtype=np.float32)
+            y_test = test_targets.max(axis=1).astype(np.float32) if len(test_targets) else np.array([], dtype=np.float32)
+        else:
+            y_train = train_targets.astype(np.float32)
+            y_valid = valid_targets.astype(np.float32)
+            y_test = test_targets.astype(np.float32)
+
+    return SequenceSplitBundle(
+        X_train=raw_train,
+        X_valid=raw_valid,
+        X_test=raw_test,
+        y_train=y_train,
+        y_valid=y_valid,
+        y_test=y_test,
+        class_labels=class_labels,
+        window_size=window_size,
+        feature_columns=measurement_columns,
+        output_mode=output_mode,
+    )
+
+
 def build_cnn_data(
     model_df: pd.DataFrame,
     *,
@@ -1775,36 +2225,43 @@ def build_cnn_data(
     train_fraction: float,
     validation_fraction: float,
     label_reduction: str,
+    split_strategy: str = "global_contiguous",
+    split_block_rows: int = 1024,
 ) -> CnnDataBundle:
     """Build fixed-length windows and normalized tensors for the notebook CNN."""
-    cnn_df = model_df[measurement_columns + ["model_target"]].copy().dropna().reset_index(drop=True)
-    usable_rows = (len(cnn_df) // window_size) * window_size
-    cnn_df = cnn_df.iloc[:usable_rows]
-    raw_sequences = cnn_df[measurement_columns].to_numpy(dtype=np.float32).reshape(-1, window_size, len(measurement_columns))
-    raw_window_targets = cnn_df["model_target"].to_numpy().reshape(-1, window_size)
+    sequence_bundle = build_sequence_split_bundle(
+        model_df,
+        measurement_columns=measurement_columns,
+        target_column="model_target",
+        task_mode=task_mode,
+        output_mode="window",
+        window_size=window_size,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+        label_reduction=label_reduction,
+        split_strategy=split_strategy,
+        split_block_rows=split_block_rows,
+    )
 
-    if task_mode == "multiclass":
-        window_targets = np.array(
-            [reduce_window_target(row, mode=label_reduction) for row in raw_window_targets],
-            dtype=np.int64,
+    X_train = np.transpose(sequence_bundle.X_train, (0, 2, 1))
+    X_valid = np.transpose(sequence_bundle.X_valid, (0, 2, 1))
+    X_test = np.transpose(sequence_bundle.X_test, (0, 2, 1))
+    y_train = sequence_bundle.y_train
+    y_valid = sequence_bundle.y_valid
+    y_test = sequence_bundle.y_test
+
+    if len(X_train) == 0 or len(X_valid) == 0 or len(X_test) == 0:
+        return CnnDataBundle(
+            X_train=X_train,
+            X_valid=X_valid,
+            X_test=X_test,
+            y_train=y_train,
+            y_valid=y_valid,
+            y_test=y_test,
+            class_labels=sequence_bundle.class_labels,
+            window_size=window_size,
+            feature_columns=measurement_columns,
         )
-        class_labels = sorted(np.unique(window_targets).tolist())
-        label_to_index = {label: index for index, label in enumerate(class_labels)}
-        encoded_targets = np.array([label_to_index[label] for label in window_targets], dtype=np.int64)
-    else:
-        class_labels = [0, 1]
-        encoded_targets = raw_window_targets.max(axis=1).astype(np.float32)
-
-    sequences = np.transpose(raw_sequences, (0, 2, 1))
-    train_end = int(len(sequences) * train_fraction)
-    valid_end = int(len(sequences) * (train_fraction + validation_fraction))
-
-    X_train = sequences[:train_end]
-    X_valid = sequences[train_end:valid_end]
-    X_test = sequences[valid_end:]
-    y_train = encoded_targets[:train_end]
-    y_valid = encoded_targets[train_end:valid_end]
-    y_test = encoded_targets[valid_end:]
 
     # Fit normalization on the training split only to avoid information leakage.
     channel_mean = X_train.mean(axis=(0, 2), keepdims=True)
@@ -1820,7 +2277,7 @@ def build_cnn_data(
         y_train=y_train,
         y_valid=y_valid,
         y_test=y_test,
-        class_labels=class_labels,
+        class_labels=sequence_bundle.class_labels,
         window_size=window_size,
         feature_columns=measurement_columns,
     )
@@ -2053,6 +2510,8 @@ def run_cnn_search(
     validation_fraction: float,
     search_space: dict[str, list[object]],
     checkpoint_dir: Path | None = None,
+    split_strategy: str = "global_contiguous",
+    split_block_rows: int = 1024,
 ) -> tuple[pd.DataFrame, dict[str, object], dict[str, object]]:
     """Grid-search a compact CNN configuration space for the advanced notebook."""
     keys = list(search_space.keys())
@@ -2071,7 +2530,21 @@ def run_cnn_search(
             train_fraction=train_fraction,
             validation_fraction=validation_fraction,
             label_reduction=config["label_reduction"],
+            split_strategy=split_strategy,
+            split_block_rows=split_block_rows,
         )
+        if len(data.X_train) == 0 or len(data.X_valid) == 0 or len(data.X_test) == 0:
+            results.append(
+                {
+                    "trial": trial_index,
+                    **config,
+                    "validation_f1": float("nan"),
+                    "best_epoch": None,
+                    "device": "skipped",
+                    "skip_reason": "At least one split produced no full windows.",
+                }
+            )
+            continue
         checkpoint_path = None
         if checkpoint_dir is not None:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
