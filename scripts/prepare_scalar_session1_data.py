@@ -796,7 +796,7 @@ def main() -> None:
                 "row_count": int(len(merged)),
                 "time_start": merged["Time UTC"].min().isoformat() if not merged.empty else None,
                 "time_end": merged["Time UTC"].max().isoformat() if not merged.empty else None,
-                "row_level_part": str(part_path),
+                "row_level_part": part_path.name,
             }
         )
         print(f"[{index}] wrote {part_path} with {len(merged):,} rows")

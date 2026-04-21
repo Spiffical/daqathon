@@ -276,7 +276,7 @@ def main() -> None:
                 "row_count": int(len(frame)),
                 "time_start": frame["Time UTC"].min().isoformat() if not frame.empty else None,
                 "time_end": frame["Time UTC"].max().isoformat() if not frame.empty else None,
-                "row_level_part": str(part_path),
+                "row_level_part": part_path.name,
             }
         )
 
