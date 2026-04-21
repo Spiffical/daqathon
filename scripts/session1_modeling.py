@@ -2301,7 +2301,7 @@ def plot_flag_examples(
     *,
     target_flag: str,
     measurement_column: str = "Conductivity (S/m)",
-    secondary_column: str = "Temperature (C)",
+    secondary_column: str | None = "Temperature (C)",
     points_per_panel: int = 300,
     classes: tuple[int, ...] = (1, 3, 4, 9),
     good_labels: list[int] | tuple[int, ...] | None = None,
@@ -2315,6 +2315,10 @@ def plot_flag_examples(
     source files or discontinuous time chunks, we therefore choose the plotting
     window from the same ``source_file`` as the representative flagged row
     rather than slicing across the globally sorted dataframe.
+
+    Some raw orientation datasets are also missing the requested secondary
+    column, especially when a profile points at mixed-device raw exports. In
+    that case we simply omit the secondary axis instead of failing.
     """
     available_classes = [flag for flag in classes if flag in set(df[target_flag].dropna().astype(int).unique())]
     if not available_classes:
@@ -2388,6 +2392,12 @@ def plot_flag_examples(
                 zorder=0,
             )
 
+        if measurement_column not in panel.columns:
+            raise KeyError(
+                f"Measurement column {measurement_column!r} is not available in the flag-example panel. "
+                f"Available columns: {sorted(panel.columns.tolist())}"
+            )
+
         axis.plot(panel["Time UTC"], panel[measurement_column], color=line_color, linewidth=1.8, label=measurement_column)
         if show_flag_points and flag not in normalized_good_labels:
             target_points = panel.loc[panel[target_flag].fillna(-1).astype(int) == flag, ["Time UTC", measurement_column]]
@@ -2405,15 +2415,22 @@ def plot_flag_examples(
         axis.set_ylabel(measurement_column)
         axis.grid(alpha=0.25)
 
-        twin_axis = axis.twinx()
-        twin_axis.plot(panel["Time UTC"], panel[secondary_column], color=temp_color, linewidth=1.2, alpha=0.6, label=secondary_column)
-        twin_axis.set_ylabel(secondary_column, color=temp_color)
-        twin_axis.tick_params(axis="y", colors=temp_color)
+        secondary_available = bool(
+            secondary_column
+            and secondary_column in panel.columns
+            and panel[secondary_column].notna().any()
+        )
+        if secondary_available:
+            twin_axis = axis.twinx()
+            twin_axis.plot(panel["Time UTC"], panel[secondary_column], color=temp_color, linewidth=1.2, alpha=0.6, label=secondary_column)
+            twin_axis.set_ylabel(secondary_column, color=temp_color)
+            twin_axis.tick_params(axis="y", colors=temp_color)
 
         legend_handles = [
             Line2D([0], [0], color=line_color, linewidth=2, label=measurement_column),
-            Line2D([0], [0], color=temp_color, linewidth=2, label=secondary_column),
         ]
+        if secondary_available:
+            legend_handles.append(Line2D([0], [0], color=temp_color, linewidth=2, label=secondary_column))
         if show_flag_points and flag not in normalized_good_labels:
             legend_handles.append(
                 Line2D(
