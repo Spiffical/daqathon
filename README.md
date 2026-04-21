@@ -4,8 +4,8 @@ This repository contains the participant materials for DAQathon Session 1 at Oce
 
 The two main notebooks are:
 
-- `notebooks/daqathon_session1_supervised_unsupervised_qc.ipynb`
-- `notebooks/daqathon_session1_supervised_unsupervised_qc_tuning.ipynb`
+- `notebooks/intro_session1_qc_workflow.ipynb`
+- `notebooks/advanced_session1_qc_workflow.ipynb`
 
 Suggested session flow:
 
@@ -105,7 +105,7 @@ Participants should treat the shared data and cache as read-only defaults.
 
 ### Main notebook
 
-Use `notebooks/daqathon_session1_supervised_unsupervised_qc.ipynb` when you want the guided Session 1 workflow:
+Use `notebooks/intro_session1_qc_workflow.ipynb` when you want the guided Session 1 workflow:
 
 - dataset orientation
 - QC flags in context
@@ -117,7 +117,7 @@ Use `notebooks/daqathon_session1_supervised_unsupervised_qc.ipynb` when you want
 
 ### Advanced notebook
 
-Use `notebooks/daqathon_session1_supervised_unsupervised_qc_tuning.ipynb` when you want to go further:
+Use `notebooks/advanced_session1_qc_workflow.ipynb` when you want to go further:
 
 - hyperparameter search
 - feature engineering

@@ -166,13 +166,13 @@ Estimated time: `10–15 min`
 Primary notebook sections:
 
 - `Part 8 — Reflection and Next Steps`
-- `notebooks/daqathon_session1_supervised_unsupervised_qc_tuning.ipynb`
+- `notebooks/advanced_session1_qc_workflow.ipynb`
 
 ## How The Two Notebooks Fit Together
 
 ### Main notebook
 
-Use [daqathon_session1_supervised_unsupervised_qc.ipynb](/home/sbialek/ONC/DAQathon/notebooks/daqathon_session1_supervised_unsupervised_qc.ipynb) for the first session:
+Use [intro_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/intro_session1_qc_workflow.ipynb) for the first session:
 
 - explore the data,
 - understand the prep workflow,
@@ -181,7 +181,7 @@ Use [daqathon_session1_supervised_unsupervised_qc.ipynb](/home/sbialek/ONC/DAQat
 
 ### Advanced notebook
 
-Use [daqathon_session1_supervised_unsupervised_qc_tuning.ipynb](/home/sbialek/ONC/DAQathon/notebooks/daqathon_session1_supervised_unsupervised_qc_tuning.ipynb) when you want to go deeper:
+Use [advanced_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/advanced_session1_qc_workflow.ipynb) when you want to go deeper:
 
 - hyperparameter search,
 - richer feature engineering,
