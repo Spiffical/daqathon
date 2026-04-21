@@ -85,6 +85,7 @@ SUPPORTED_SPLIT_STRATEGIES = (
     "global_contiguous",
     "per_source_contiguous",
     "interleaved_blocks",
+    "episode_aware",
 )
 
 
@@ -104,6 +105,27 @@ def issue_mask(values: pd.Series, issue_labels: list[int] | tuple[int, ...] | No
     return numeric.isin(normalized_issue_labels)
 
 
+def reviewed_label_mask(
+    values: pd.Series,
+    *,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+) -> pd.Series:
+    """Return a boolean mask for rows whose labels have actually been reviewed.
+
+    Some datasets include placeholder or "not yet reviewed" labels such as ``0``.
+    Those rows are useful to count during dataset inspection, but they should not
+    be treated as supervised training targets. This helper keeps the reviewed set
+    explicit by combining the accepted ``good`` and ``issue`` labels.
+    """
+
+    normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
+    normalized_issue_labels = normalize_label_list(issue_labels, DEFAULT_ISSUE_LABELS)
+    numeric = pd.to_numeric(values, errors="coerce")
+    reviewed_labels = set(normalized_good_labels).union(normalized_issue_labels)
+    return numeric.isin(reviewed_labels)
+
+
 @dataclass(frozen=True)
 class CacheBundlePaths:
     """Paths for one named cache bundle under a shared cache root."""
@@ -113,6 +135,21 @@ class CacheBundlePaths:
     row_level_dir: Path
     window_cache_path: Path
     metadata_path: Path
+
+
+@dataclass
+class SplitUnit:
+    """One contiguous row slice that must stay together during split assignment."""
+
+    source_key: object
+    start: int
+    end: int
+    kind: str
+    split: str | None = None
+
+    @property
+    def row_count(self) -> int:
+        return max(int(self.end - self.start), 0)
 
 
 def _normalize_cache_stem(cache_stem: str) -> str:
@@ -335,8 +372,10 @@ def load_cache_bundle(
     part_selection_mode: str = "spread",
     rows_per_file: int = 45000,
     issue_rows_per_file: int = 12000,
+    sample_strategy: str = "time_spread",
     window_limit: int | None = None,
     target_flag: str = "Conductivity QC Flag",
+    good_labels: list[int] | tuple[int, ...] | None = None,
     issue_labels: list[int] | tuple[int, ...] | None = None,
     row_columns: list[str] | None = None,
     window_columns: list[str] | None = None,
@@ -365,7 +404,9 @@ def load_cache_bundle(
         selected_paths,
         rows_per_file=rows_per_file,
         issue_rows_per_file=issue_rows_per_file,
+        sample_strategy=sample_strategy,
         target_flag=target_flag,
+        good_labels=good_labels,
         issue_labels=issue_labels,
         columns=row_columns,
     )
@@ -390,11 +431,25 @@ def load_row_level_sample(
     *,
     rows_per_file: int | None,
     issue_rows_per_file: int,
+    sample_strategy: str = "time_spread",
     target_flag: str,
+    good_labels: list[int] | tuple[int, ...] | None = None,
     issue_labels: list[int] | tuple[int, ...] | None = None,
+    balanced_issue_share: float = 0.5,
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Load a row-level sample from each parquet part with optional issue enrichment."""
+    """Load a row-level sample from each parquet part using one sampling strategy.
+
+    Supported strategies:
+
+    - ``time_spread``: keep an evenly spaced slice from the full parquet part.
+    - ``issue_focused``: start from a time-spread slice, then add extra reviewed
+      issue rows before trimming back to ``rows_per_file``.
+    - ``balanced_reviewed``: move the reviewed sample toward a configurable
+      issue share by drawing from the reviewed good and reviewed issue groups
+      separately. ``balanced_issue_share`` controls the target reviewed issue
+      fraction for that mode.
+    """
     row_frames = []
     for path in part_paths:
         frame = pd.read_parquet(path, columns=columns).sort_values("Time UTC").reset_index(drop=True)
@@ -402,16 +457,289 @@ def load_row_level_sample(
         if rows_per_file is None:
             sampled_frame = frame
         else:
-            base_limit = max(rows_per_file - issue_rows_per_file, 0)
-            sampled_frame = evenly_spaced_take(frame, base_limit)
-            if issue_rows_per_file > 0 and target_flag in frame.columns:
-                issue_frame = frame[issue_mask(frame[target_flag], issue_labels)].reset_index(drop=True)
-                issue_sample = evenly_spaced_take(issue_frame, issue_rows_per_file)
-                sampled_frame = pd.concat([sampled_frame, issue_sample], ignore_index=True)
-                sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
-                sampled_frame = evenly_spaced_take(sampled_frame, rows_per_file)
+            sampled_frame = sample_frame_by_strategy(
+                frame,
+                rows_limit=rows_per_file,
+                sample_strategy=sample_strategy,
+                target_flag=target_flag,
+                good_labels=good_labels,
+                issue_labels=issue_labels,
+                issue_rows=issue_rows_per_file,
+                balanced_issue_share=balanced_issue_share,
+            )
         row_frames.append(sampled_frame)
     return pd.concat(row_frames, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
+
+
+def sample_frame_by_strategy(
+    frame: pd.DataFrame,
+    *,
+    rows_limit: int | None,
+    sample_strategy: str,
+    target_flag: str,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+    issue_rows: int = 0,
+    balanced_issue_share: float = 0.5,
+) -> pd.DataFrame:
+    """Sample one dataframe according to a notebook sampling strategy.
+
+    This is used in two places:
+
+    - when creating a lightweight inspection sample from the cache, and
+    - when shrinking only the training split in the stricter benchmark flow.
+
+    ``balanced_issue_share`` is only used by ``balanced_reviewed``. It sets the
+    target fraction of reviewed rows that should come from issue labels. A value
+    of ``0.5`` asks for a 50/50 reviewed good-vs-issue mix, while smaller
+    values such as ``0.2`` or ``0.25`` give issue rows a gentler boost.
+    """
+
+    work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
+    if rows_limit is None or len(work) <= rows_limit:
+        return work
+
+    normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
+    normalized_issue_labels = normalize_label_list(issue_labels, DEFAULT_ISSUE_LABELS)
+
+    if sample_strategy == "time_spread":
+        return evenly_spaced_take(work, rows_limit)
+
+    if sample_strategy == "issue_focused":
+        base_limit = max(rows_limit - issue_rows, 0)
+        sampled_frame = evenly_spaced_take(work, base_limit)
+        if issue_rows > 0 and target_flag in work.columns:
+            issue_frame = work[issue_mask(work[target_flag], normalized_issue_labels)].reset_index(drop=True)
+            issue_sample = evenly_spaced_take(issue_frame, issue_rows)
+            sampled_frame = pd.concat([sampled_frame, issue_sample], ignore_index=True)
+            sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+        return evenly_spaced_take(sampled_frame, rows_limit)
+
+    if sample_strategy == "balanced_reviewed":
+        if not 0 < balanced_issue_share < 1:
+            raise ValueError("balanced_issue_share must be in the open interval (0, 1)")
+        reviewed_frame = work[
+            reviewed_label_mask(
+                work[target_flag],
+                good_labels=normalized_good_labels,
+                issue_labels=normalized_issue_labels,
+            )
+        ].reset_index(drop=True)
+        if reviewed_frame.empty:
+            return evenly_spaced_take(work, rows_limit)
+
+        good_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_good_labels)].reset_index(drop=True)
+        issue_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_issue_labels)].reset_index(drop=True)
+
+        def _sample_group(group_frame: pd.DataFrame, group_labels: list[int], target_rows: int) -> pd.DataFrame:
+            if group_frame.empty or target_rows <= 0:
+                return group_frame.iloc[0:0].copy()
+            present_labels = [label for label in group_labels if label in set(group_frame[target_flag].astype(int).unique().tolist())]
+            if not present_labels:
+                return evenly_spaced_take(group_frame, target_rows)
+            per_label_limit = max(int(np.ceil(target_rows / len(present_labels))), 1)
+            label_samples = []
+            for label in present_labels:
+                label_frame = group_frame[group_frame[target_flag].astype(int) == label].reset_index(drop=True)
+                label_samples.append(evenly_spaced_take(label_frame, per_label_limit))
+            group_sample = pd.concat(label_samples, ignore_index=True)
+            group_sample = group_sample.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+            if len(group_sample) < target_rows:
+                group_fill = evenly_spaced_take(group_frame, target_rows)
+                group_sample = pd.concat([group_sample, group_fill], ignore_index=True)
+                group_sample = group_sample.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+            return evenly_spaced_take(group_sample, target_rows)
+
+        issue_target = int(round(rows_limit * balanced_issue_share))
+        issue_target = min(max(issue_target, 0), rows_limit)
+        good_target = rows_limit - issue_target
+
+        good_sample = _sample_group(good_frame, normalized_good_labels, good_target)
+        issue_sample = _sample_group(issue_frame, normalized_issue_labels, issue_target)
+
+        sampled_frame = pd.concat([good_sample, issue_sample], ignore_index=True)
+        sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+        if len(sampled_frame) < rows_limit:
+            reviewed_fill = evenly_spaced_take(reviewed_frame, rows_limit)
+            sampled_frame = pd.concat([sampled_frame, reviewed_fill], ignore_index=True)
+            sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+        return evenly_spaced_take(sampled_frame, rows_limit)
+
+    raise ValueError(f"Unsupported sample_strategy: {sample_strategy}")
+
+
+def load_full_row_level_frame(
+    part_paths: list[Path],
+    *,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Load and concatenate the full row-level parquet data for selected parts."""
+
+    frames = []
+    for path in part_paths:
+        frame = pd.read_parquet(path, columns=columns).sort_values("Time UTC").reset_index(drop=True)
+        frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True)
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=columns or [])
+    return pd.concat(frames, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
+
+
+def load_selected_row_level_frame(
+    part_paths: list[Path],
+    selection_frame: pd.DataFrame,
+    *,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Load only the row-level parquet rows that match a selected split frame.
+
+    The selection frame is expected to contain ``source_file`` and ``Time UTC``.
+    This helper keeps memory use lower than concatenating the full parquet cache
+    when the notebook only needs the rows that survived the chosen split and
+    train-subset settings.
+    """
+
+    required_columns = ["source_file", "Time UTC"]
+    requested_columns = list(dict.fromkeys(required_columns + list(columns or [])))
+    if selection_frame.empty:
+        return pd.DataFrame(columns=requested_columns)
+
+    if "source_file" not in selection_frame.columns or "Time UTC" not in selection_frame.columns:
+        raise ValueError("selection_frame must contain 'source_file' and 'Time UTC'.")
+
+    selection_keys = selection_frame[required_columns].drop_duplicates().copy()
+    selection_keys["source_file"] = selection_keys["source_file"].astype(str)
+    selection_keys["Time UTC"] = pd.to_datetime(selection_keys["Time UTC"], utc=True)
+    selection_by_source = {
+        str(source_file): group["Time UTC"].astype("int64").to_numpy(copy=False)
+        for source_file, group in selection_keys.groupby("source_file", sort=False)
+    }
+
+    frames: list[pd.DataFrame] = []
+    for path in part_paths:
+        frame = pd.read_parquet(path, columns=requested_columns)
+        if frame.empty:
+            continue
+        frame["source_file"] = frame["source_file"].astype(str)
+        frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True)
+
+        part_source_files = frame["source_file"].dropna().unique().tolist()
+        relevant_sources = [source_file for source_file in part_source_files if source_file in selection_by_source]
+        if not relevant_sources:
+            continue
+
+        part_time_values = frame["Time UTC"].astype("int64").to_numpy(copy=False)
+        part_source_values = frame["source_file"].to_numpy(copy=False)
+        match_mask = np.zeros(len(frame), dtype=bool)
+
+        for source_file in relevant_sources:
+            source_mask = part_source_values == source_file
+            if not source_mask.any():
+                continue
+            match_mask[source_mask] = np.isin(
+                part_time_values[source_mask],
+                selection_by_source[source_file],
+                assume_unique=False,
+            )
+
+        matched = frame.loc[match_mask].copy()
+        if not matched.empty:
+            frames.append(matched)
+
+    if not frames:
+        return pd.DataFrame(columns=requested_columns)
+    return pd.concat(frames, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
+
+
+def build_reviewed_target_frame(
+    df: pd.DataFrame,
+    *,
+    target_flag: str,
+    task_mode: str,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+    model_row_limit: int | None = None,
+) -> tuple[pd.DataFrame, list[int]]:
+    """Filter to reviewed rows and add ``issue`` / ``model_target`` columns.
+
+    This lighter-weight helper is useful before split selection, when the
+    notebook only needs label semantics and timestamps rather than the full
+    tabular feature set.
+    """
+
+    work = df.copy()
+    work = work[
+        reviewed_label_mask(
+            work[target_flag],
+            good_labels=good_labels,
+            issue_labels=issue_labels,
+        )
+    ].copy()
+    work = work.dropna(subset=[target_flag]).reset_index(drop=True)
+    work["issue"] = issue_mask(work[target_flag], issue_labels).astype(int)
+
+    if model_row_limit is not None and len(work) > model_row_limit:
+        work = evenly_spaced_take(work, model_row_limit)
+
+    if task_mode == "multiclass":
+        work["model_target"] = work[target_flag].astype(int)
+    elif task_mode == "binary":
+        work["model_target"] = work["issue"].astype(int)
+    else:
+        raise ValueError(f"Unsupported task mode: {task_mode}")
+
+    active_labels = sorted(work["model_target"].dropna().astype(int).unique().tolist())
+    return work, active_labels
+
+
+def add_tabular_baseline_features(
+    frame: pd.DataFrame,
+    *,
+    measurement_columns: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add the baseline RF-style tabular features to a reviewed frame."""
+
+    work = frame.copy()
+    work["hour_utc"] = work["Time UTC"].dt.hour
+    work["minute_utc"] = work["Time UTC"].dt.minute
+    work["day_of_year"] = work["Time UTC"].dt.dayofyear
+
+    for column in measurement_columns:
+        work[f"{column} abs_delta"] = work[column].diff().abs().fillna(0.0)
+
+    feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns] + [
+        "hour_utc",
+        "minute_utc",
+        "day_of_year",
+    ]
+    return work, feature_columns
+
+
+def materialize_reviewed_split_frames(
+    part_paths: list[Path],
+    split_frames: dict[str, pd.DataFrame],
+    *,
+    columns: list[str],
+    target_flag: str,
+    task_mode: str,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Load raw rows for selected splits, then rebuild reviewed label frames."""
+
+    materialized: dict[str, pd.DataFrame] = {}
+    for split_name, selection_frame in split_frames.items():
+        raw_frame = load_selected_row_level_frame(part_paths, selection_frame, columns=columns)
+        reviewed_frame, _ = build_reviewed_target_frame(
+            raw_frame,
+            target_flag=target_flag,
+            task_mode=task_mode,
+            good_labels=good_labels,
+            issue_labels=issue_labels,
+            model_row_limit=None,
+        )
+        materialized[split_name] = reviewed_frame
+    return materialized
 
 
 def build_distribution_frame(metadata: dict[str, object], df: pd.DataFrame, target_flag: str) -> pd.DataFrame:
@@ -438,6 +766,125 @@ def summarize_split_distributions(
     ).fillna(0).astype(int)
     share_frame = count_frame.div(count_frame.sum(axis=0), axis=1).fillna(0.0)
     return count_frame, share_frame
+
+
+def summarize_target_by_time_bin(
+    frame: pd.DataFrame,
+    *,
+    time_column: str,
+    label_column: str,
+    bin_count: int = 24,
+    labels: list[int] | None = None,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Summarize how target labels are distributed across evenly spaced time bins.
+
+    This is meant as an early dataset-verification helper for the notebooks.
+    It answers a simple but important question before any model is trained:
+    do the interesting labels appear throughout time, or are they concentrated
+    in just a few regions?
+
+    Returns three aligned dataframes:
+
+    - ``count_frame``: rows are time bins, columns are labels, values are counts
+    - ``share_frame``: same shape, normalized within each time bin
+    - ``summary_frame``: one row per bin with start/end timestamps, total rows,
+      issue rows, and issue share percentage
+    """
+
+    work = frame[[time_column, label_column]].dropna().copy()
+    if work.empty:
+        empty_counts = pd.DataFrame(columns=labels or [])
+        empty_summary = pd.DataFrame(
+            columns=[
+                "bin_index",
+                "time_start",
+                "time_end",
+                "rows",
+                "reviewed_rows",
+                "unreviewed_rows",
+                "reviewed_share_pct",
+                "issue_rows",
+                "issue_share_pct",
+            ]
+        )
+        return empty_counts, empty_counts.copy(), empty_summary
+
+    work[time_column] = pd.to_datetime(work[time_column], utc=True)
+    work[label_column] = work[label_column].astype(int)
+
+    if labels is None:
+        labels = sorted(work[label_column].unique().tolist())
+
+    issue_label_set = set(normalize_label_list(issue_labels, DEFAULT_ISSUE_LABELS))
+    if not issue_label_set:
+        issue_label_set = set(DEFAULT_ISSUE_LABELS)
+    reviewed_mask = reviewed_label_mask(
+        work[label_column],
+        good_labels=good_labels,
+        issue_labels=issue_labels,
+    )
+
+    time_values = work[time_column].astype("int64").to_numpy()
+    requested_bin_count = max(int(bin_count), 1)
+    effective_bin_count = min(requested_bin_count, max(len(work), 1))
+    raw_edges = np.linspace(time_values.min(), time_values.max(), effective_bin_count + 1, dtype=np.int64)
+    edges = np.unique(raw_edges)
+    if len(edges) < 2:
+        edges = np.array([time_values.min(), time_values.min() + 1], dtype=np.int64)
+
+    work["_time_bin"] = pd.cut(
+        time_values,
+        bins=edges,
+        include_lowest=True,
+        labels=False,
+        duplicates="drop",
+    )
+    work = work.dropna(subset=["_time_bin"]).copy()
+    work["_time_bin"] = work["_time_bin"].astype(int)
+    work["_is_issue"] = work[label_column].isin(issue_label_set).astype(int)
+    work["_is_reviewed"] = reviewed_mask.loc[work.index].astype(int)
+
+    bin_index = pd.Index(sorted(work["_time_bin"].unique().tolist()), name="time_bin")
+    count_frame = (
+        work.groupby(["_time_bin", label_column]).size().unstack(fill_value=0).reindex(index=bin_index, columns=labels, fill_value=0)
+    )
+    share_frame = count_frame.div(count_frame.sum(axis=1), axis=0).fillna(0.0)
+
+    issue_rows = work.groupby("_time_bin")["_is_issue"].sum().reindex(bin_index, fill_value=0)
+    total_rows = work.groupby("_time_bin").size().reindex(bin_index, fill_value=0)
+    reviewed_rows = work.groupby("_time_bin")["_is_reviewed"].sum().reindex(bin_index, fill_value=0)
+
+    summary_rows = []
+    for time_bin in bin_index:
+        start_index = int(time_bin)
+        end_index = min(start_index + 1, len(edges) - 1)
+        summary_rows.append(
+            {
+                "bin_index": int(time_bin),
+                "time_start": pd.to_datetime(int(edges[start_index]), utc=True),
+                "time_end": pd.to_datetime(int(edges[end_index]), utc=True),
+                "rows": int(total_rows.loc[time_bin]),
+                "reviewed_rows": int(reviewed_rows.loc[time_bin]),
+                "unreviewed_rows": int(total_rows.loc[time_bin] - reviewed_rows.loc[time_bin]),
+                "issue_rows": int(issue_rows.loc[time_bin]),
+                "issue_share_pct": round(
+                    100.0 * float(issue_rows.loc[time_bin]) / float(reviewed_rows.loc[time_bin])
+                    if int(reviewed_rows.loc[time_bin]) > 0
+                    else 0.0,
+                    2,
+                ),
+                "reviewed_share_pct": round(
+                    100.0 * float(reviewed_rows.loc[time_bin]) / float(total_rows.loc[time_bin])
+                    if int(total_rows.loc[time_bin]) > 0
+                    else 0.0,
+                    2,
+                ),
+            }
+        )
+    summary_frame = pd.DataFrame(summary_rows)
+    return count_frame, share_frame, summary_frame
 
 
 def compute_split_share_gap(share_frame: pd.DataFrame) -> dict[str, float]:
@@ -471,19 +918,242 @@ def _split_slot_name(
     validation_fraction: float,
     cycle_length: int = 20,
 ) -> str:
-    """Map one repeating block index onto a train/validation/test slot."""
+    """Map one repeating block index onto an interleaved train/validation/test slot."""
 
     if cycle_length < 3:
         raise ValueError("cycle_length must be at least 3")
 
     train_slots = min(max(int(round(cycle_length * train_fraction)), 1), cycle_length - 2)
     validation_slots = min(max(int(round(cycle_length * validation_fraction)), 1), cycle_length - train_slots - 1)
-    slot = int(block_index % cycle_length)
-    if slot < train_slots:
-        return "train"
-    if slot < train_slots + validation_slots:
-        return "validation"
-    return "test"
+    test_slots = max(cycle_length - train_slots - validation_slots, 1)
+
+    target_counts = {
+        "train": train_slots,
+        "validation": validation_slots,
+        "test": test_slots,
+    }
+    built_counts = {split_name: 0 for split_name in target_counts}
+    schedule: list[str] = []
+
+    for slot_index in range(cycle_length):
+        horizon = slot_index + 1
+
+        def _slot_score(split_name: str) -> tuple[float, int, int]:
+            target = target_counts[split_name]
+            deficit = (target * horizon / cycle_length) - built_counts[split_name]
+            return (deficit, target, -built_counts[split_name])
+
+        chosen = max(target_counts, key=_slot_score)
+        schedule.append(chosen)
+        built_counts[chosen] += 1
+
+    return schedule[int(block_index % cycle_length)]
+
+
+def _find_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return contiguous ``True`` runs as half-open ``(start, end)`` row slices."""
+
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for index, is_true in enumerate(mask.tolist()):
+        if is_true and run_start is None:
+            run_start = index
+        elif not is_true and run_start is not None:
+            runs.append((run_start, index))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(mask)))
+    return runs
+
+
+def _merge_intervals(intervals: list[tuple[int, int]], gap_rows: int = 0) -> list[tuple[int, int]]:
+    """Merge half-open intervals that overlap or sit within ``gap_rows`` rows."""
+
+    if not intervals:
+        return []
+
+    merged: list[tuple[int, int]] = []
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end + gap_rows:
+            current_end = max(current_end, end)
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def _build_episode_intervals(
+    issue_mask_values: np.ndarray,
+    *,
+    context_rows: int,
+    merge_gap_rows: int,
+) -> list[tuple[int, int]]:
+    """Build contiguous episode intervals from issue rows plus local clean context."""
+
+    raw_runs = _find_true_runs(issue_mask_values.astype(bool))
+    if not raw_runs:
+        return []
+
+    merged_runs = _merge_intervals(raw_runs, gap_rows=max(int(merge_gap_rows), 0))
+    expanded_runs = [
+        (
+            max(0, start - max(int(context_rows), 0)),
+            min(len(issue_mask_values), end + max(int(context_rows), 0)),
+        )
+        for start, end in merged_runs
+    ]
+    return _merge_intervals(expanded_runs, gap_rows=0)
+
+
+def _build_clean_units(
+    source_key: object,
+    start: int,
+    end: int,
+    *,
+    block_rows: int,
+) -> list[SplitUnit]:
+    """Chunk one clean interval into fixed-size split units."""
+
+    units: list[SplitUnit] = []
+    for block_start in range(start, end, block_rows):
+        block_end = min(block_start + block_rows, end)
+        if block_end > block_start:
+            units.append(SplitUnit(source_key=source_key, start=block_start, end=block_end, kind="clean"))
+    return units
+
+
+def _build_episode_aware_units(
+    source_frame: pd.DataFrame,
+    *,
+    source_key: object,
+    issue_mask_values: np.ndarray,
+    block_rows: int,
+    episode_context_rows: int,
+    episode_merge_gap_rows: int,
+) -> list[SplitUnit]:
+    """Partition one source into episode units plus clean background blocks."""
+
+    episode_intervals = _build_episode_intervals(
+        issue_mask_values,
+        context_rows=episode_context_rows,
+        merge_gap_rows=episode_merge_gap_rows,
+    )
+    if not episode_intervals:
+        return _build_clean_units(source_key, 0, len(source_frame), block_rows=block_rows)
+
+    units: list[SplitUnit] = []
+    cursor = 0
+    for start, end in episode_intervals:
+        if cursor < start:
+            units.extend(_build_clean_units(source_key, cursor, start, block_rows=block_rows))
+        units.append(SplitUnit(source_key=source_key, start=start, end=end, kind="episode"))
+        cursor = end
+    if cursor < len(source_frame):
+        units.extend(_build_clean_units(source_key, cursor, len(source_frame), block_rows=block_rows))
+    return units
+
+
+def _issue_mask_from_frame(
+    frame: pd.DataFrame,
+    *,
+    issue_column: str,
+    target_column: str | None,
+    issue_labels: list[int] | tuple[int, ...] | None,
+) -> np.ndarray:
+    """Extract a boolean issue mask from either an explicit issue column or raw labels."""
+
+    if issue_column in frame.columns:
+        numeric = pd.to_numeric(frame[issue_column], errors="coerce").fillna(0).astype(int)
+        return numeric.eq(1).to_numpy()
+    if target_column is not None and target_column in frame.columns:
+        return issue_mask(frame[target_column], issue_labels).to_numpy()
+    raise ValueError(
+        "episode_aware split requires either an issue column or a target column plus issue labels."
+    )
+
+
+def _assign_episode_aware_units(
+    units: list[SplitUnit],
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+) -> None:
+    """Assign episode units first, then fill remaining clean units toward row targets."""
+
+    if not units:
+        return
+
+    split_names = ("train", "validation", "test")
+    total_rows = float(sum(unit.row_count for unit in units))
+    target_rows = {
+        "train": total_rows * float(train_fraction),
+        "validation": total_rows * float(validation_fraction),
+        "test": max(total_rows * float(1.0 - train_fraction - validation_fraction), 0.0),
+    }
+    current_rows = {split_name: 0.0 for split_name in split_names}
+
+    episode_units = [unit for unit in units if unit.kind == "episode"]
+    episode_cycle_length = max(3, min(len(episode_units), 20))
+    episode_index = 0
+    for unit in episode_units:
+        unit.split = _split_slot_name(
+            episode_index,
+            train_fraction=train_fraction,
+            validation_fraction=validation_fraction,
+            cycle_length=episode_cycle_length,
+        )
+        current_rows[unit.split] += float(unit.row_count)
+        episode_index += 1
+
+    for unit in units:
+        if unit.split is not None:
+            continue
+
+        def _deficit_score(split_name: str) -> tuple[float, float, float]:
+            target = max(target_rows[split_name], 1.0)
+            deficit = target_rows[split_name] - current_rows[split_name]
+            return (deficit / target, deficit, -current_rows[split_name])
+
+        unit.split = max(split_names, key=_deficit_score)
+        current_rows[unit.split] += float(unit.row_count)
+
+
+def _append_trimmed_unit_frames(
+    split_frames: dict[str, list[pd.DataFrame]],
+    source_frame: pd.DataFrame,
+    source_units: list[SplitUnit],
+    *,
+    purge_gap_rows: int,
+) -> None:
+    """Append source slices to their assigned split, trimming purge gaps at boundaries."""
+
+    if not source_units:
+        return
+
+    left_trim = max(int(purge_gap_rows), 0) // 2
+    right_trim = max(int(purge_gap_rows), 0) - left_trim
+
+    for index, unit in enumerate(source_units):
+        if unit.split is None:
+            continue
+
+        start = int(unit.start)
+        end = int(unit.end)
+
+        if purge_gap_rows > 0:
+            if index > 0 and source_units[index - 1].split != unit.split:
+                start += left_trim
+            if index < len(source_units) - 1 and source_units[index + 1].split != unit.split:
+                end -= right_trim
+
+        start = max(start, int(unit.start))
+        end = min(end, int(unit.end))
+        if end <= start:
+            continue
+
+        split_frames[unit.split].append(source_frame.iloc[start:end].copy())
 
 
 def _finalize_split_frames(
@@ -518,6 +1188,12 @@ def split_frame_by_strategy(
     source_column: str = "source_file",
     block_rows: int = 1024,
     block_cycle_length: int = 20,
+    issue_column: str = "issue",
+    target_column: str | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+    episode_context_rows: int = 0,
+    episode_merge_gap_rows: int = 0,
+    purge_gap_rows: int = 0,
 ) -> dict[str, pd.DataFrame]:
     """Split a time-ordered dataframe with one of the notebook split strategies.
 
@@ -529,6 +1205,8 @@ def split_frame_by_strategy(
     - ``interleaved_blocks``: keep short local time blocks intact, but distribute
       them across train/validation/test in a repeating schedule so each split sees
       more of the deployment's operating regimes.
+    - ``episode_aware``: keep detected issue episodes, plus local clean context,
+      entirely inside one split and optionally leave purge gaps between splits.
     """
 
     if strategy not in SUPPORTED_SPLIT_STRATEGIES:
@@ -552,7 +1230,7 @@ def split_frame_by_strategy(
     split_frames: dict[str, list[pd.DataFrame]] = {"train": [], "validation": [], "test": []}
 
     if strategy == "per_source_contiguous":
-        for _, source_frame in ordered.groupby(source_column, sort=False):
+        for _, source_frame in ordered.groupby(source_column, sort=False, observed=False):
             local_train, local_valid, local_test = contiguous_split(
                 source_frame.reset_index(drop=True),
                 train_fraction=train_fraction,
@@ -563,8 +1241,47 @@ def split_frame_by_strategy(
             split_frames["test"].append(local_test)
         return _finalize_split_frames(split_frames, template_frame=ordered, time_column=time_column)
 
+    if strategy == "episode_aware":
+        source_units_by_key: dict[object, list[SplitUnit]] = {}
+        ordered_units: list[SplitUnit] = []
+
+        for source_key, source_frame in ordered.groupby(source_column, sort=False, observed=False):
+            source_frame = source_frame.reset_index(drop=True)
+            local_issue_mask = _issue_mask_from_frame(
+                source_frame,
+                issue_column=issue_column,
+                target_column=target_column,
+                issue_labels=issue_labels,
+            )
+            source_units = _build_episode_aware_units(
+                source_frame,
+                source_key=source_key,
+                issue_mask_values=local_issue_mask,
+                block_rows=block_rows,
+                episode_context_rows=episode_context_rows,
+                episode_merge_gap_rows=episode_merge_gap_rows,
+            )
+            source_units_by_key[source_key] = source_units
+            ordered_units.extend(source_units)
+
+        _assign_episode_aware_units(
+            ordered_units,
+            train_fraction=train_fraction,
+            validation_fraction=validation_fraction,
+        )
+
+        for source_key, source_frame in ordered.groupby(source_column, sort=False, observed=False):
+            source_frame = source_frame.reset_index(drop=True)
+            _append_trimmed_unit_frames(
+                split_frames,
+                source_frame,
+                source_units_by_key.get(source_key, []),
+                purge_gap_rows=purge_gap_rows,
+            )
+        return _finalize_split_frames(split_frames, template_frame=ordered, time_column=time_column)
+
     global_block_index = 0
-    for _, source_frame in ordered.groupby(source_column, sort=False):
+    for _, source_frame in ordered.groupby(source_column, sort=False, observed=False):
         source_frame = source_frame.reset_index(drop=True)
         for start in range(0, len(source_frame), block_rows):
             block = source_frame.iloc[start : start + block_rows].copy()
@@ -697,6 +1414,7 @@ def build_model_frame(
     measurement_columns: list[str] | None = None,
     columns: list[str] | None = None,
     task_mode: str,
+    good_labels: list[int] | tuple[int, ...] | None = None,
     issue_labels: list[int] | tuple[int, ...] | None = None,
     model_row_limit: int | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -712,34 +1430,18 @@ def build_model_frame(
     if measurement_columns is None:
         raise ValueError("build_model_frame requires measurement_columns or columns.")
 
-    model_df = df.copy()
-    model_df["issue"] = issue_mask(model_df[target_flag], issue_labels).astype(int)
-    model_df["hour_utc"] = model_df["Time UTC"].dt.hour
-    model_df["minute_utc"] = model_df["Time UTC"].dt.minute
-    model_df["day_of_year"] = model_df["Time UTC"].dt.dayofyear
-
-    # Absolute deltas are a simple way to expose sudden sensor changes to the model.
-    for column in measurement_columns:
-        model_df[f"{column} abs_delta"] = model_df[column].diff().abs().fillna(0.0)
-
-    feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns] + [
-        "hour_utc",
-        "minute_utc",
-        "day_of_year",
-    ]
-
-    model_df = model_df.dropna(subset=[target_flag]).reset_index(drop=True)
-    if model_row_limit is not None and len(model_df) > model_row_limit:
-        model_df = evenly_spaced_take(model_df, model_row_limit)
-
-    if task_mode == "multiclass":
-        model_df["model_target"] = model_df[target_flag].astype(int)
-    elif task_mode == "binary":
-        model_df["model_target"] = model_df["issue"].astype(int)
-    else:
-        raise ValueError(f"Unsupported task mode: {task_mode}")
-
-    active_labels = sorted(model_df["model_target"].dropna().astype(int).unique().tolist())
+    model_df, active_labels = build_reviewed_target_frame(
+        df,
+        target_flag=target_flag,
+        task_mode=task_mode,
+        good_labels=good_labels,
+        issue_labels=issue_labels,
+        model_row_limit=model_row_limit,
+    )
+    model_df, feature_columns = add_tabular_baseline_features(
+        model_df,
+        measurement_columns=measurement_columns,
+    )
     return model_df, feature_columns, active_labels
 
 
@@ -1641,17 +2343,36 @@ def plot_flag_examples(
             source_flag_rows = source_panel.index[source_panel[target_flag].fillna(-1).astype(int) == flag].tolist()
             if source_flag_rows:
                 source_center_index = source_flag_rows[len(source_flag_rows) // 2]
-                start = max(source_center_index - points_per_panel // 2, 0)
+                span_start_index = source_center_index
+                while span_start_index > 0 and int(source_panel.iloc[span_start_index - 1][target_flag]) == flag:
+                    span_start_index -= 1
+                span_end_index = source_center_index
+                while (
+                    span_end_index + 1 < len(source_panel)
+                    and int(source_panel.iloc[span_end_index + 1][target_flag]) == flag
+                ):
+                    span_end_index += 1
+
+                # Center the panel on the midpoint of the contiguous target span
+                # rather than on an arbitrary example row. This keeps the
+                # highlighted issue closer to the middle of the subplot.
+                span_midpoint_index = (span_start_index + span_end_index) // 2
+                start = max(span_midpoint_index - points_per_panel // 2, 0)
                 stop = min(start + points_per_panel, len(source_panel))
+                if stop - start < points_per_panel:
+                    start = max(stop - points_per_panel, 0)
                 panel = source_panel.iloc[start:stop].copy()
+                example_time = source_panel.iloc[span_midpoint_index]["Time UTC"]
             else:
                 start = max(center_index - points_per_panel // 2, 0)
                 stop = min(start + points_per_panel, len(work))
                 panel = work.iloc[start:stop].copy()
+                example_time = center_row["Time UTC"]
         else:
             start = max(center_index - points_per_panel // 2, 0)
             stop = min(start + points_per_panel, len(work))
             panel = work.iloc[start:stop].copy()
+            example_time = center_row["Time UTC"]
         panel_spans = _iter_flag_spans(panel, target_flag, good_labels=good_labels)
         flags_in_panel = sorted({span_flag for span_flag, _, _ in panel_spans})
 
@@ -1724,7 +2445,7 @@ def plot_flag_examples(
                 "meaning": QC_FLAG_MEANINGS.get(flag, "unknown"),
                 "panel_start": panel["Time UTC"].min(),
                 "panel_end": panel["Time UTC"].max(),
-                "example_time": center_row["Time UTC"],
+                "example_time": example_time,
                 "source_file": clean_source_file_label(center_row["source_file"]) if "source_file" in work.columns else None,
             }
         )
@@ -2140,6 +2861,38 @@ def build_sequence_split_bundle(
         block_rows=split_block_rows,
     )
 
+    return build_sequence_split_bundle_from_frames(
+        split_frames,
+        measurement_columns=measurement_columns,
+        target_column=target_column,
+        task_mode=task_mode,
+        output_mode=output_mode,
+        window_size=window_size,
+        label_reduction=label_reduction,
+        time_column=time_column,
+        source_column=source_column,
+    )
+
+
+def build_sequence_split_bundle_from_frames(
+    split_frames: dict[str, pd.DataFrame],
+    *,
+    measurement_columns: list[str],
+    target_column: str,
+    task_mode: str,
+    output_mode: str,
+    window_size: int,
+    label_reduction: str,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> SequenceSplitBundle:
+    """Build fixed-window sequence arrays from precomputed split frames.
+
+    This is the stricter benchmark path: the caller can define train/validation/
+    test on the full reviewed dataset first, optionally subsample only the train
+    split, and then turn those finalized splits into windows.
+    """
+
     raw_train, train_targets = _frame_to_fixed_windows(
         split_frames["train"],
         measurement_columns=measurement_columns,
@@ -2242,6 +2995,47 @@ def build_cnn_data(
         split_strategy=split_strategy,
         split_block_rows=split_block_rows,
     )
+
+    return build_cnn_data_from_sequence_bundle(
+        sequence_bundle,
+        measurement_columns=measurement_columns,
+        window_size=window_size,
+    )
+
+
+def build_cnn_data_from_frames(
+    split_frames: dict[str, pd.DataFrame],
+    *,
+    measurement_columns: list[str],
+    task_mode: str,
+    window_size: int,
+    label_reduction: str,
+) -> CnnDataBundle:
+    """Build fixed-length CNN tensors from precomputed split frames."""
+    sequence_bundle = build_sequence_split_bundle_from_frames(
+        split_frames,
+        measurement_columns=measurement_columns,
+        target_column="model_target",
+        task_mode=task_mode,
+        output_mode="window",
+        window_size=window_size,
+        label_reduction=label_reduction,
+    )
+
+    return build_cnn_data_from_sequence_bundle(
+        sequence_bundle,
+        measurement_columns=measurement_columns,
+        window_size=window_size,
+    )
+
+
+def build_cnn_data_from_sequence_bundle(
+    sequence_bundle: SequenceSplitBundle,
+    *,
+    measurement_columns: list[str],
+    window_size: int,
+) -> CnnDataBundle:
+    """Convert a raw sequence bundle into normalized CNN tensors."""
 
     X_train = np.transpose(sequence_bundle.X_train, (0, 2, 1))
     X_valid = np.transpose(sequence_bundle.X_valid, (0, 2, 1))
@@ -2532,6 +3326,71 @@ def run_cnn_search(
             label_reduction=config["label_reduction"],
             split_strategy=split_strategy,
             split_block_rows=split_block_rows,
+        )
+        if len(data.X_train) == 0 or len(data.X_valid) == 0 or len(data.X_test) == 0:
+            results.append(
+                {
+                    "trial": trial_index,
+                    **config,
+                    "validation_f1": float("nan"),
+                    "best_epoch": None,
+                    "device": "skipped",
+                    "skip_reason": "At least one split produced no full windows.",
+                }
+            )
+            continue
+        checkpoint_path = None
+        if checkpoint_dir is not None:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = checkpoint_dir / f"cnn_trial_{trial_index:02d}.pt"
+        result = train_cnn_model(
+            data,
+            task_mode=task_mode,
+            config=config,
+            seed=seed,
+            checkpoint_path=checkpoint_path,
+        )
+        row = {
+            "trial": trial_index,
+            **config,
+            "validation_f1": result["best_validation_f1"],
+            "best_epoch": result["best_epoch"],
+            "device": result["device"],
+        }
+        results.append(row)
+        if result["best_validation_f1"] > best_score:
+            best_score = result["best_validation_f1"]
+            best_config = config
+            best_result = result
+
+    result_frame = pd.DataFrame(results).sort_values("validation_f1", ascending=False).reset_index(drop=True)
+    return result_frame, best_config, best_result
+
+
+def run_cnn_search_from_frames(
+    split_frames: dict[str, pd.DataFrame],
+    *,
+    measurement_columns: list[str],
+    task_mode: str,
+    seed: int,
+    search_space: dict[str, list[object]],
+    checkpoint_dir: Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, object], dict[str, object]]:
+    """Grid-search the CNN while keeping validation/test fixed from precomputed splits."""
+    keys = list(search_space.keys())
+    results = []
+    best_score = -math.inf
+    best_config = None
+    best_result = None
+
+    for trial_index, values in enumerate(itertools.product(*(search_space[key] for key in keys)), start=1):
+        config = dict(zip(keys, values))
+        data = build_cnn_data_from_frames(
+            split_frames,
+            measurement_columns=measurement_columns,
+            task_mode=task_mode,
+            window_size=config["window_size"],
+            label_reduction=config["label_reduction"],
         )
         if len(data.X_train) == 0 or len(data.X_valid) == 0 or len(data.X_test) == 0:
             results.append(

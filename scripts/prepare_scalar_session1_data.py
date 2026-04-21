@@ -197,7 +197,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-tolerance-seconds",
         type=int,
-        default=120,
+        default=5,
         help="Nearest-merge tolerance in seconds when joining secondary devices onto the primary stream.",
     )
     return parser.parse_args()
