@@ -102,6 +102,32 @@ class CsvFileInfo:
     end_time: pd.Timestamp | None
 
 
+@dataclass
+class RowLevelCacheResult:
+    """Summary returned after writing row-level parquet parts."""
+
+    all_available_columns: list[str]
+    grouped_infos: dict[str, list[CsvFileInfo]]
+    limited_paths: dict[str, list[Path]]
+    selected_infos: dict[str, list[CsvFileInfo]]
+    requested_measurement_columns: list[str] | None
+    measurement_columns: list[str]
+    missing_measurement_columns: list[str]
+    qc_columns: list[str]
+    processed_files: list[dict[str, object]]
+    total_rows: int
+    target_counts: Counter[int]
+    row_columns: list[str]
+
+
+@dataclass
+class WindowLevelCacheResult:
+    """Summary returned after writing the window-summary parquet file."""
+
+    window_count: int
+    window_columns: list[str]
+
+
 def normalize_cache_stem(value: str) -> str:
     """Normalize and validate the user-facing cache bundle name.
 
@@ -647,37 +673,42 @@ def simulate_merged_columns(
     return merged_columns
 
 
-def main() -> None:
-    """Run the full scalar cache-preparation pipeline.
+def write_row_level_parquet_cache(
+    *,
+    data_root: Path,
+    bundle_paths: CacheBundlePaths,
+    target_flag: str,
+    primary_device: str,
+    max_files: int | None,
+    sample_rows: int | None,
+    requested_measurement_columns: list[str] | None,
+    merge_tolerance_seconds: int,
+    clear_existing: bool = True,
+) -> RowLevelCacheResult:
+    """Create the row-level parquet cache from raw scalar CSV files.
 
-    High-level flow
-    ----------------
-    1. parse command-line settings
-    2. discover all CSV files and their available columns
-    3. optionally reduce the file set while keeping secondary devices aligned
-    4. read and merge the selected device streams
-    5. choose the measurement columns to preserve
-    6. write row-level parquet parts
-    7. build and write the window-summary parquet
-    8. write metadata describing exactly what was produced
+    This step owns the raw-data work:
 
-    The notebooks rely heavily on the metadata file, so this function is also
-    responsible for recording enough context to make later reads transparent.
+    - discover available CSV columns,
+    - choose primary and companion device files,
+    - read and type CSV rows,
+    - align secondary devices onto the primary timestamps,
+    - write one row-level parquet part per primary CSV file.
+
+    The output is still row-shaped: one row per timestamp.
     """
 
-    args = parse_args()
-    data_root = args.data_root.expanduser().resolve()
-    bundle_paths = build_cache_bundle_paths(args.cache_root, args.cache_stem)
+    data_root = data_root.expanduser().resolve()
     bundle_paths.root.mkdir(parents=True, exist_ok=True)
     bundle_paths.row_level_dir.mkdir(parents=True, exist_ok=True)
+    if clear_existing:
+        for existing in bundle_paths.row_level_dir.glob("*.parquet"):
+            existing.unlink()
 
     all_csv_files = sorted(data_root.glob("*.csv"))
     if not all_csv_files:
-        raise SystemExit(f"No CSV files found in {data_root}")
+        raise ValueError(f"No CSV files found in {data_root}")
 
-    # Discover schema and device families across the full folder before any
-    # sampling or file-count truncation. This avoids the old failure mode where
-    # a small file subset accidentally hid one of the secondary device streams.
     all_available_columns = discover_available_columns(all_csv_files)
     grouped_infos: dict[str, list[CsvFileInfo]] = {"ctd": [], "fluorometer": [], "oxygen": [], "other": []}
     for csv_path in all_csv_files:
@@ -689,57 +720,44 @@ def main() -> None:
 
     limited_paths = select_time_aligned_paths(
         grouped_infos,
-        primary_device=args.primary_device,
-        max_files=args.max_files,
+        primary_device=primary_device,
+        max_files=max_files,
     )
     selected_infos = {
         device: [info for info in infos if info.path in set(limited_paths.get(device, []))]
         for device, infos in grouped_infos.items()
     }
 
-    primary_infos = selected_infos.get(args.primary_device, [])
+    primary_infos = selected_infos.get(primary_device, [])
     if not primary_infos:
-        raise SystemExit(
-            f"Expected at least one {args.primary_device!r} file based on --primary-device"
-        )
+        raise ValueError(f"Expected at least one {primary_device!r} file based on primary_device")
 
-    requested_measurement_columns = parse_measurement_columns(args.measurement_columns)
-    clear_old_outputs(bundle_paths)
-    bundle_paths.row_level_dir.mkdir(parents=True, exist_ok=True)
-
-    merge_tolerance = pd.Timedelta(seconds=args.merge_tolerance_seconds)
-    issue_labels = sorted(dict.fromkeys(args.issue_labels or DEFAULT_ISSUE_LABELS))
-    all_columns = simulate_merged_columns(selected_infos, primary_device=args.primary_device)
+    merge_tolerance = pd.Timedelta(seconds=merge_tolerance_seconds)
+    all_columns = simulate_merged_columns(selected_infos, primary_device=primary_device)
     qc_columns = [column for column in all_columns if is_qc_like_column(column)]
 
-    if args.target_flag not in all_columns:
-        raise SystemExit(f"Target flag '{args.target_flag}' not found after merge")
+    if target_flag not in all_columns:
+        raise ValueError(f"Target flag '{target_flag}' not found after merge")
 
     measurement_columns = choose_measurement_columns(
         all_columns,
         requested_measurement_columns=requested_measurement_columns,
     )
-    measurement_columns = [column for column in measurement_columns if column != args.target_flag]
+    measurement_columns = [column for column in measurement_columns if column != target_flag]
     missing_measurement_columns = [
         column
         for column in (requested_measurement_columns or [])
         if column not in measurement_columns
     ]
 
-    secondary_devices = [device for device in ("ctd", "fluorometer", "oxygen", "other") if device != args.primary_device]
+    secondary_devices = [device for device in ("ctd", "fluorometer", "oxygen", "other") if device != primary_device]
     total_rows = 0
     target_counts: Counter[int] = Counter()
     processed_files: list[dict[str, object]] = []
-    window_frames: list[pd.DataFrame] = []
 
-    # Process one aligned primary file at a time. This keeps peak memory use
-    # close to "one primary chunk plus a few companion chunks" instead of the
-    # full merged dataset across all files.
     for index, primary_info in enumerate(primary_infos, start=1):
-        merged = read_scalar_csv(primary_info.path, args.sample_rows).sort_values("Time UTC").reset_index(drop=True)
+        merged = read_scalar_csv(primary_info.path, sample_rows).sort_values("Time UTC").reset_index(drop=True)
 
-        # Merge each secondary stream onto the primary timestamps using
-        # nearest-time alignment within a controlled tolerance.
         for device_name in secondary_devices:
             device_infos = selected_infos.get(device_name, [])
             if not device_infos:
@@ -749,7 +767,7 @@ def main() -> None:
             if companion_info is None:
                 continue
 
-            secondary = read_scalar_csv(companion_info.path, args.sample_rows).sort_values("Time UTC").reset_index(drop=True)
+            secondary = read_scalar_csv(companion_info.path, sample_rows).sort_values("Time UTC").reset_index(drop=True)
             rename_map = {}
             for column in secondary.columns:
                 if column in {"Time UTC", "source_file"}:
@@ -777,18 +795,8 @@ def main() -> None:
         part_path = bundle_paths.row_level_dir / f"part-{index:03d}.parquet"
         merged.to_parquet(part_path, index=False)
 
-        window_frames.append(
-            build_window_features(
-                merged,
-                target_flag=args.target_flag,
-                window_size=args.window_size,
-                measurement_columns=measurement_columns,
-                issue_labels=issue_labels,
-            )
-        )
-
         total_rows += len(merged)
-        target_counts.update(merged[args.target_flag].dropna().astype(int).tolist())
+        target_counts.update(merged[target_flag].dropna().astype(int).tolist())
 
         processed_files.append(
             {
@@ -799,48 +807,180 @@ def main() -> None:
                 "row_level_part": part_path.name,
             }
         )
-        print(f"[{index}] wrote {part_path} with {len(merged):,} rows")
+        print(f"[row {index}] wrote {part_path} with {len(merged):,} rows")
 
-    window_frame = pd.concat(window_frames, ignore_index=True)
-    window_frame.to_parquet(bundle_paths.window_cache_path, index=False)
+    return RowLevelCacheResult(
+        all_available_columns=all_available_columns,
+        grouped_infos=grouped_infos,
+        limited_paths=limited_paths,
+        selected_infos=selected_infos,
+        requested_measurement_columns=requested_measurement_columns,
+        measurement_columns=measurement_columns,
+        missing_measurement_columns=missing_measurement_columns,
+        qc_columns=qc_columns,
+        processed_files=processed_files,
+        total_rows=int(total_rows),
+        target_counts=target_counts,
+        row_columns=all_columns,
+    )
+
+
+def write_window_level_parquet_cache(
+    *,
+    bundle_paths: CacheBundlePaths,
+    processed_files: list[dict[str, object]],
+    target_flag: str,
+    window_size: int,
+    measurement_columns: list[str],
+    issue_labels: list[int],
+) -> WindowLevelCacheResult:
+    """Create the window-summary parquet cache from row-level parquet parts.
+
+    This step does not read raw CSV files. It starts from the row-level parquet
+    files and creates one summary row per fixed-size contiguous row window.
+    """
+
+    window_frames: list[pd.DataFrame] = []
+    for index, file_info in enumerate(processed_files, start=1):
+        row_part_path = bundle_paths.row_level_dir / Path(str(file_info["row_level_part"])).name
+        row_frame = pd.read_parquet(row_part_path)
+        window_frame = build_window_features(
+            row_frame,
+            target_flag=target_flag,
+            window_size=window_size,
+            measurement_columns=measurement_columns,
+            issue_labels=issue_labels,
+        )
+        window_frames.append(window_frame)
+        print(f"[window {index}] summarized {row_part_path.name} into {len(window_frame):,} windows")
+
+    if window_frames:
+        window_cache_frame = pd.concat(window_frames, ignore_index=True)
+    else:
+        window_cache_frame = pd.DataFrame()
+    window_cache_frame.to_parquet(bundle_paths.window_cache_path, index=False)
+    return WindowLevelCacheResult(
+        window_count=int(len(window_cache_frame)),
+        window_columns=window_cache_frame.columns.tolist(),
+    )
+
+
+def write_cache_metadata(
+    *,
+    bundle_paths: CacheBundlePaths,
+    row_result: RowLevelCacheResult,
+    window_result: WindowLevelCacheResult,
+    target_flag: str,
+    sample_rows: int | None,
+    window_size: int,
+    issue_labels: list[int],
+    merge_tolerance_seconds: int,
+    primary_device: str,
+    file_selection_strategy: str,
+) -> dict[str, object]:
+    """Write metadata describing the row-level and window-level parquet cache."""
+
+    metadata = {
+        "target_flag": target_flag,
+        "cache_root": str(bundle_paths.root),
+        "cache_stem": bundle_paths.stem,
+        "measurement_columns": row_result.measurement_columns,
+        "requested_measurement_columns": row_result.requested_measurement_columns or [],
+        "missing_measurement_columns": row_result.missing_measurement_columns,
+        "qc_columns": row_result.qc_columns,
+        "processed_file_count": len(row_result.processed_files),
+        "row_count": int(row_result.total_rows),
+        "window_count": window_result.window_count,
+        "sample_rows_per_file": sample_rows,
+        "window_size": window_size,
+        "issue_labels": issue_labels,
+        "target_distribution": {str(key): int(value) for key, value in sorted(row_result.target_counts.items())},
+        "issue_fraction": (
+            float(sum(row_result.target_counts.get(flag, 0) for flag in issue_labels) / row_result.total_rows)
+            if row_result.total_rows
+            else 0.0
+        ),
+        "processed_files": row_result.processed_files,
+        "row_level_cache": str(bundle_paths.row_level_dir),
+        "window_cache": str(bundle_paths.window_cache_path),
+        "row_columns": row_result.row_columns,
+        "window_columns": window_result.window_columns,
+        "device_file_counts": {device: len(infos) for device, infos in row_result.grouped_infos.items()},
+        "limited_device_file_counts": {device: len(paths) for device, paths in row_result.limited_paths.items()},
+        "file_selection_strategy": file_selection_strategy,
+        "merge_tolerance_seconds": merge_tolerance_seconds,
+        "primary_device": primary_device,
+        "all_available_columns": row_result.all_available_columns,
+    }
+    bundle_paths.metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata
+
+
+def main() -> None:
+    """Run the full scalar cache-preparation pipeline.
+
+    High-level flow
+    ----------------
+    1. parse command-line settings
+    2. discover all CSV files and their available columns
+    3. optionally reduce the file set while keeping secondary devices aligned
+    4. read and merge the selected device streams
+    5. choose the measurement columns to preserve
+    6. write row-level parquet parts
+    7. build and write the window-summary parquet
+    8. write metadata describing exactly what was produced
+
+    The notebooks rely heavily on the metadata file, so this function is also
+    responsible for recording enough context to make later reads transparent.
+    """
+
+    args = parse_args()
+    data_root = args.data_root.expanduser().resolve()
+    bundle_paths = build_cache_bundle_paths(args.cache_root, args.cache_stem)
+    bundle_paths.root.mkdir(parents=True, exist_ok=True)
+    requested_measurement_columns = parse_measurement_columns(args.measurement_columns)
+    clear_old_outputs(bundle_paths)
+    issue_labels = sorted(dict.fromkeys(args.issue_labels or DEFAULT_ISSUE_LABELS))
+    try:
+        row_result = write_row_level_parquet_cache(
+            data_root=data_root,
+            bundle_paths=bundle_paths,
+            target_flag=args.target_flag,
+            primary_device=args.primary_device,
+            max_files=args.max_files,
+            sample_rows=args.sample_rows,
+            requested_measurement_columns=requested_measurement_columns,
+            merge_tolerance_seconds=args.merge_tolerance_seconds,
+            clear_existing=False,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    window_result = write_window_level_parquet_cache(
+        bundle_paths=bundle_paths,
+        processed_files=row_result.processed_files,
+        target_flag=args.target_flag,
+        window_size=args.window_size,
+        measurement_columns=row_result.measurement_columns,
+        issue_labels=issue_labels,
+    )
 
     # The metadata file is what makes the prepared cache self-describing. The
     # notebooks use it to discover measurement columns, cache stems, source-file
     # coverage, target distributions, and other context without hard-coding
     # assumptions about a specific dataset.
-    metadata = {
-        "target_flag": args.target_flag,
-        "cache_root": str(bundle_paths.root),
-        "cache_stem": bundle_paths.stem,
-        "measurement_columns": measurement_columns,
-        "requested_measurement_columns": requested_measurement_columns or [],
-        "missing_measurement_columns": missing_measurement_columns,
-        "qc_columns": qc_columns,
-        "processed_file_count": len(processed_files),
-        "row_count": int(total_rows),
-        "window_count": int(len(window_frame)),
-        "sample_rows_per_file": args.sample_rows,
-        "window_size": args.window_size,
-        "issue_labels": issue_labels,
-        "target_distribution": {str(key): int(value) for key, value in sorted(target_counts.items())},
-        "issue_fraction": (
-            float(sum(target_counts.get(flag, 0) for flag in issue_labels) / total_rows)
-            if total_rows
-            else 0.0
-        ),
-        "processed_files": processed_files,
-        "row_level_cache": str(bundle_paths.row_level_dir),
-        "window_cache": str(bundle_paths.window_cache_path),
-        "row_columns": all_columns,
-        "window_columns": window_frame.columns.tolist(),
-        "device_file_counts": {device: len(infos) for device, infos in grouped_infos.items()},
-        "limited_device_file_counts": {device: len(paths) for device, paths in limited_paths.items()},
-        "file_selection_strategy": "primary_time_aligned_selection" if args.max_files is not None else "all_files",
-        "merge_tolerance_seconds": args.merge_tolerance_seconds,
-        "primary_device": args.primary_device,
-        "all_available_columns": all_available_columns,
-    }
-    bundle_paths.metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    write_cache_metadata(
+        bundle_paths=bundle_paths,
+        row_result=row_result,
+        window_result=window_result,
+        target_flag=args.target_flag,
+        sample_rows=args.sample_rows,
+        window_size=args.window_size,
+        issue_labels=issue_labels,
+        merge_tolerance_seconds=args.merge_tolerance_seconds,
+        primary_device=args.primary_device,
+        file_selection_strategy="primary_time_aligned_selection" if args.max_files is not None else "all_files",
+    )
 
     print(
         json.dumps(
@@ -849,12 +989,12 @@ def main() -> None:
                 "window_cache": str(bundle_paths.window_cache_path),
                 "metadata": str(bundle_paths.metadata_path),
                 "cache_stem": bundle_paths.stem,
-                "rows": int(total_rows),
-                "windows": int(len(window_frame)),
-                "target_distribution": {str(key): int(value) for key, value in sorted(target_counts.items())},
-                "device_file_counts": {device: len(infos) for device, infos in grouped_infos.items()},
-                "limited_device_file_counts": {device: len(paths) for device, paths in limited_paths.items()},
-                "missing_measurement_columns": missing_measurement_columns,
+                "rows": int(row_result.total_rows),
+                "windows": window_result.window_count,
+                "target_distribution": {str(key): int(value) for key, value in sorted(row_result.target_counts.items())},
+                "device_file_counts": {device: len(infos) for device, infos in row_result.grouped_infos.items()},
+                "limited_device_file_counts": {device: len(paths) for device, paths in row_result.limited_paths.items()},
+                "missing_measurement_columns": row_result.missing_measurement_columns,
             },
             indent=2,
         )

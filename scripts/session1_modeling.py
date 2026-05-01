@@ -487,12 +487,12 @@ def sample_frame_by_strategy(
     This is used in two places:
 
     - when creating a lightweight inspection sample from the cache, and
-    - when shrinking only the training split in the stricter benchmark flow.
+    - when shrinking only the training split in the fixed-split modelling flow.
 
-    ``balanced_issue_share`` is only used by ``balanced_reviewed``. It sets the
-    target fraction of reviewed rows that should come from issue labels. A value
-    of ``0.5`` asks for a 50/50 reviewed good-vs-issue mix, while smaller
-    values such as ``0.2`` or ``0.25`` give issue rows a gentler boost.
+    ``balanced_issue_share`` is only used by ``balanced_reviewed``. It sets a
+    target fraction of reviewed rows that should come from issue labels. If the
+    full training split has too few issue rows to hit that target, the sampler
+    keeps all available issue rows and fills the remaining budget with good rows.
     """
 
     work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
@@ -530,6 +530,11 @@ def sample_frame_by_strategy(
 
         good_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_good_labels)].reset_index(drop=True)
         issue_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_issue_labels)].reset_index(drop=True)
+        dedupe_columns = [
+            column
+            for column in ("source_file", "Time UTC")
+            if column in reviewed_frame.columns
+        ]
 
         def _sample_group(group_frame: pd.DataFrame, group_labels: list[int], target_rows: int) -> pd.DataFrame:
             if group_frame.empty or target_rows <= 0:
@@ -543,27 +548,51 @@ def sample_frame_by_strategy(
                 label_frame = group_frame[group_frame[target_flag].astype(int) == label].reset_index(drop=True)
                 label_samples.append(evenly_spaced_take(label_frame, per_label_limit))
             group_sample = pd.concat(label_samples, ignore_index=True)
-            group_sample = group_sample.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+            if dedupe_columns:
+                group_sample = group_sample.drop_duplicates(subset=dedupe_columns)
+            else:
+                group_sample = group_sample.drop_duplicates()
+            group_sample = group_sample.sort_values("Time UTC")
             if len(group_sample) < target_rows:
                 group_fill = evenly_spaced_take(group_frame, target_rows)
                 group_sample = pd.concat([group_sample, group_fill], ignore_index=True)
-                group_sample = group_sample.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+                if dedupe_columns:
+                    group_sample = group_sample.drop_duplicates(subset=dedupe_columns)
+                else:
+                    group_sample = group_sample.drop_duplicates()
+                group_sample = group_sample.sort_values("Time UTC")
             return evenly_spaced_take(group_sample, target_rows)
 
         issue_target = int(round(rows_limit * balanced_issue_share))
         issue_target = min(max(issue_target, 0), rows_limit)
+        issue_target = min(issue_target, len(issue_frame))
         good_target = rows_limit - issue_target
 
         good_sample = _sample_group(good_frame, normalized_good_labels, good_target)
         issue_sample = _sample_group(issue_frame, normalized_issue_labels, issue_target)
 
         sampled_frame = pd.concat([good_sample, issue_sample], ignore_index=True)
-        sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
+        if dedupe_columns:
+            sampled_frame = sampled_frame.drop_duplicates(subset=dedupe_columns)
+        else:
+            sampled_frame = sampled_frame.drop_duplicates()
+        sampled_frame = sampled_frame.sort_values("Time UTC").reset_index(drop=True)
         if len(sampled_frame) < rows_limit:
-            reviewed_fill = evenly_spaced_take(reviewed_frame, rows_limit)
+            if dedupe_columns and not sampled_frame.empty:
+                selected_keys = set(map(tuple, sampled_frame[dedupe_columns].to_numpy()))
+                fill_candidates = reviewed_frame[
+                    ~reviewed_frame[dedupe_columns].apply(tuple, axis=1).isin(selected_keys)
+                ]
+            else:
+                fill_candidates = reviewed_frame.drop(sampled_frame.index, errors="ignore")
+            reviewed_fill = evenly_spaced_take(fill_candidates, rows_limit - len(sampled_frame))
             sampled_frame = pd.concat([sampled_frame, reviewed_fill], ignore_index=True)
-            sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
-        return evenly_spaced_take(sampled_frame, rows_limit)
+            if dedupe_columns:
+                sampled_frame = sampled_frame.drop_duplicates(subset=dedupe_columns)
+            else:
+                sampled_frame = sampled_frame.drop_duplicates()
+            sampled_frame = sampled_frame.sort_values("Time UTC").reset_index(drop=True)
+        return sampled_frame.iloc[:rows_limit].sort_values("Time UTC").reset_index(drop=True)
 
     raise ValueError(f"Unsupported sample_strategy: {sample_strategy}")
 
@@ -590,6 +619,7 @@ def load_selected_row_level_frame(
     selection_frame: pd.DataFrame,
     *,
     columns: list[str] | None = None,
+    batch_size: int = 250_000,
 ) -> pd.DataFrame:
     """Load only the row-level parquet rows that match a selected split frame.
 
@@ -617,38 +647,123 @@ def load_selected_row_level_frame(
 
     frames: list[pd.DataFrame] = []
     for path in part_paths:
-        frame = pd.read_parquet(path, columns=requested_columns)
-        if frame.empty:
-            continue
-        frame["source_file"] = frame["source_file"].astype(str)
-        frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True)
-
-        part_source_files = frame["source_file"].dropna().unique().tolist()
-        relevant_sources = [source_file for source_file in part_source_files if source_file in selection_by_source]
-        if not relevant_sources:
-            continue
-
-        part_time_values = frame["Time UTC"].astype("int64").to_numpy(copy=False)
-        part_source_values = frame["source_file"].to_numpy(copy=False)
-        match_mask = np.zeros(len(frame), dtype=bool)
-
-        for source_file in relevant_sources:
-            source_mask = part_source_values == source_file
-            if not source_mask.any():
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches(columns=requested_columns, batch_size=batch_size):
+            frame = batch.to_pandas()
+            if frame.empty:
                 continue
-            match_mask[source_mask] = np.isin(
-                part_time_values[source_mask],
-                selection_by_source[source_file],
-                assume_unique=False,
-            )
+            frame["source_file"] = frame["source_file"].astype(str)
+            frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["Time UTC"])
+            if frame.empty:
+                continue
 
-        matched = frame.loc[match_mask].copy()
-        if not matched.empty:
-            frames.append(matched)
+            part_source_values = frame["source_file"].to_numpy(copy=False)
+            part_time_values = frame["Time UTC"].astype("int64").to_numpy(copy=False)
+            match_mask = np.zeros(len(frame), dtype=bool)
+
+            relevant_sources = [source_file for source_file in pd.unique(part_source_values) if source_file in selection_by_source]
+            if not relevant_sources:
+                continue
+
+            for source_file in relevant_sources:
+                source_mask = part_source_values == source_file
+                if not source_mask.any():
+                    continue
+                match_mask[source_mask] = np.isin(
+                    part_time_values[source_mask],
+                    selection_by_source[source_file],
+                    assume_unique=False,
+                )
+
+            if match_mask.any():
+                frames.append(frame.loc[match_mask].copy())
 
     if not frames:
         return pd.DataFrame(columns=requested_columns)
     return pd.concat(frames, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
+
+
+def load_parquet_context_panel(
+    row_part_path: str | Path,
+    *,
+    center_time: str | pd.Timestamp,
+    columns: list[str],
+    context_points: int,
+    time_column: str = "Time UTC",
+    batch_size: int = 250_000,
+) -> pd.DataFrame:
+    """Load a small row-count context panel around one timestamp from a parquet part.
+
+    This uses two streaming passes over the parquet file:
+
+    1. scan the time column to find the row closest to ``center_time``
+    2. reload only the requested row slice around that index
+
+    It keeps the k-means example plots usable even when one row-level parquet
+    part covers months of high-frequency data.
+    """
+
+    parquet_file = pq.ParquetFile(row_part_path)
+    center_timestamp = pd.Timestamp(pd.to_datetime(center_time, utc=True))
+    center_ns = center_timestamp.value
+
+    best_index: int | None = None
+    best_delta: int | None = None
+    global_offset = 0
+    total_rows = int(parquet_file.metadata.num_rows)
+
+    for batch in parquet_file.iter_batches(columns=[time_column], batch_size=batch_size):
+        time_values = pd.to_datetime(batch.column(0).to_pandas(), utc=True, errors="coerce")
+        if time_values.empty:
+            global_offset += len(time_values)
+            continue
+        time_ns = time_values.astype("int64").to_numpy(copy=False)
+        valid_mask = ~pd.isna(time_values).to_numpy()
+        if valid_mask.any():
+            valid_indices = np.nonzero(valid_mask)[0]
+            valid_ns = time_ns[valid_mask]
+            deltas = np.abs(valid_ns - center_ns)
+            local_best = int(deltas.argmin())
+            candidate_delta = int(deltas[local_best])
+            candidate_index = global_offset + int(valid_indices[local_best])
+            if best_delta is None or candidate_delta < best_delta:
+                best_delta = candidate_delta
+                best_index = candidate_index
+        global_offset += len(time_values)
+
+    if best_index is None:
+        return pd.DataFrame(columns=columns)
+
+    start_index = max(best_index - context_points // 2, 0)
+    stop_index = min(start_index + context_points, total_rows)
+    if stop_index - start_index < context_points:
+        start_index = max(stop_index - context_points, 0)
+
+    frames: list[pd.DataFrame] = []
+    global_offset = 0
+    for batch in parquet_file.iter_batches(columns=columns, batch_size=batch_size):
+        batch_length = len(batch)
+        batch_start = global_offset
+        batch_stop = global_offset + batch_length
+        overlap_start = max(start_index, batch_start)
+        overlap_stop = min(stop_index, batch_stop)
+        if overlap_stop > overlap_start:
+            local_start = overlap_start - batch_start
+            local_stop = overlap_stop - batch_start
+            frame = batch.to_pandas().iloc[local_start:local_stop].copy()
+            if not frame.empty:
+                frame[time_column] = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
+                frame = frame.dropna(subset=[time_column])
+                if not frame.empty:
+                    frames.append(frame)
+        global_offset = batch_stop
+        if global_offset >= stop_index:
+            break
+
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True).sort_values(time_column).reset_index(drop=True)
 
 
 def build_reviewed_target_frame(
@@ -1480,7 +1595,7 @@ def apply_target_strategy(
     *,
     issue_labels: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[pd.DataFrame, list[int], str]:
-    """Map raw QC flags into one of the teaching target strategies."""
+    """Map raw target labels into one of the teaching target strategies."""
     work = frame.copy()
     if strategy == "raw_multiclass":
         work["strategy_target"] = work[target_flag].astype(int)
@@ -1666,7 +1781,7 @@ def _span_boundaries(times: pd.Series, start_index: int, stop_index: int) -> tup
 
 
 def _flag_span_boundaries(panel: pd.DataFrame, start_index: int, stop_index: int) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """Delegate QC-flag shading boundaries to the generic span helper."""
+    """Delegate target-label shading boundaries to the generic span helper."""
     return _span_boundaries(panel["Time UTC"], start_index, stop_index)
 
 
@@ -1676,7 +1791,7 @@ def _iter_flag_spans(
     *,
     good_labels: list[int] | tuple[int, ...] | None = None,
 ) -> list[tuple[int, pd.Timestamp, pd.Timestamp]]:
-    """Return contiguous non-good QC regions as (flag, span_start, span_end)."""
+    """Return contiguous non-good target regions as (label, span_start, span_end)."""
     normalized_good_labels = set(normalize_label_list(good_labels, DEFAULT_GOOD_LABELS))
     flag_values = panel[target_flag].copy()
     if pd.api.types.is_numeric_dtype(flag_values):
@@ -1756,6 +1871,7 @@ def load_rows_for_time_range(
     start: str | pd.Timestamp | None,
     end: str | pd.Timestamp | None,
     columns: list[str] | None = None,
+    batch_size: int = 250_000,
 ) -> pd.DataFrame:
     """Load only the row-level parquet parts needed for a selected time interval."""
     overlapping_parts = select_overlapping_row_parts(metadata, row_cache_dir, start=start, end=end)
@@ -1766,16 +1882,22 @@ def load_rows_for_time_range(
 
     start_ts = parse_optional_utc_datetime(start)
     end_ts = parse_optional_utc_datetime(end)
+    requested_columns = list(dict.fromkeys(["Time UTC"] + list(columns or []))) if columns else None
     frames = []
     for row in overlapping_parts.itertuples(index=False):
-        frame = pd.read_parquet(row.row_part_path, columns=columns).sort_values("Time UTC").reset_index(drop=True)
-        frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True)
-        if start_ts is not None:
-            frame = frame[frame["Time UTC"] >= start_ts]
-        if end_ts is not None:
-            frame = frame[frame["Time UTC"] <= end_ts]
-        if not frame.empty:
-            frames.append(frame)
+        parquet_file = pq.ParquetFile(row.row_part_path)
+        for batch in parquet_file.iter_batches(columns=requested_columns, batch_size=batch_size):
+            frame = batch.to_pandas()
+            if frame.empty:
+                continue
+            frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["Time UTC"])
+            if start_ts is not None:
+                frame = frame[frame["Time UTC"] >= start_ts]
+            if end_ts is not None:
+                frame = frame[frame["Time UTC"] <= end_ts]
+            if not frame.empty:
+                frames.append(frame.copy())
 
     if not frames:
         if columns:
@@ -1964,6 +2086,8 @@ def plot_time_series_with_bands(
     secondary_column: str = "Temperature (C)",
     max_points: int | None = None,
     title: str = "Time-range model demo",
+    label_meanings: dict[int, str] | None = None,
+    legend_title: str = "label",
 ) -> plt.Figure:
     """Plot sensor traces with one or more aligned label-band panels underneath."""
     if row_frame.empty:
@@ -1985,6 +2109,15 @@ def plot_time_series_with_bands(
     )
     if row_count == 1:
         axes = [axes]
+    meaning_lookup = {int(label): str(meaning) for label, meaning in (label_meanings or {}).items()}
+
+    def legend_label(label: object) -> str:
+        try:
+            label_value = int(label)
+        except (TypeError, ValueError):
+            return str(label)
+        meaning = meaning_lookup.get(label_value)
+        return f"{label_value}: {meaning}" if meaning else str(label_value)
 
     main_axis = axes[0]
     band_axes = axes[1:]
@@ -2032,12 +2165,13 @@ def plot_time_series_with_bands(
                 axis.text(midpoint, 0.5, str(row.label), ha="center", va="center", fontsize=9, color="#111827")
 
         legend_handles = [
-            Patch(facecolor=palette.get(label, "#64748b"), edgecolor="none", alpha=0.7, label=str(label))
+            Patch(facecolor=palette.get(label, "#64748b"), edgecolor="none", alpha=0.7, label=legend_label(label))
             for label in label_order[:8]
         ]
         if legend_handles:
             axis.legend(
                 handles=legend_handles,
+                title=legend_title,
                 loc="upper left",
                 bbox_to_anchor=(1.01, 1.0),
                 borderaxespad=0.0,
@@ -2300,15 +2434,18 @@ def plot_flag_examples(
     df: pd.DataFrame,
     *,
     target_flag: str,
+    target_display_name: str = "QC flag",
+    label_meanings: dict[int, str] | None = None,
     measurement_column: str = "Conductivity (S/m)",
     secondary_column: str | None = "Temperature (C)",
     points_per_panel: int = 300,
     classes: tuple[int, ...] = (1, 3, 4, 9),
     good_labels: list[int] | tuple[int, ...] | None = None,
+    avoid_context_labels: list[int] | tuple[int, ...] | None = None,
     region_alpha: float = 0.18,
     show_flag_points: bool = True,
 ) -> tuple[plt.Figure, pd.DataFrame]:
-    """Plot representative QC-flag examples with shaded regions and sensor traces.
+    """Plot representative labelled examples with shaded regions and sensor traces.
 
     The important detail is that each plotted panel should stay *locally
     contiguous in time*. When the incoming dataframe contains rows from several
@@ -2324,7 +2461,11 @@ def plot_flag_examples(
     if not available_classes:
         raise ValueError(f"No requested classes found in {target_flag}")
 
+    meaning_lookup = dict(QC_FLAG_MEANINGS if label_meanings is None else label_meanings)
     work = df.sort_values("Time UTC").reset_index(drop=True).copy()
+    duplicate_columns = [column for column in ["source_file", "Time UTC"] if column in work.columns]
+    if duplicate_columns:
+        work = work.drop_duplicates(subset=duplicate_columns).reset_index(drop=True)
     fig, axes = plt.subplots(len(available_classes), 1, figsize=(15, 3.6 * len(available_classes)), sharex=False)
     if len(available_classes) == 1:
         axes = [axes]
@@ -2334,49 +2475,112 @@ def plot_flag_examples(
     colors = dict(DEFAULT_FLAG_PALETTE)
     line_color = "#0f172a"
     temp_color = "#059669"
+    avoid_context_set = set(int(label) for label in (avoid_context_labels or ()))
+    used_panel_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+
+    def _window_overlap_share(start_a: pd.Timestamp, end_a: pd.Timestamp, start_b: pd.Timestamp, end_b: pd.Timestamp) -> float:
+        overlap_seconds = max(0.0, (min(end_a, end_b) - max(start_a, start_b)).total_seconds())
+        duration_seconds = max(1.0, (end_a - start_a).total_seconds())
+        return overlap_seconds / duration_seconds
+
+    def _contiguous_spans(row_indices: list[int]) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        if not row_indices:
+            return spans
+        span_start = row_indices[0]
+        previous_index = row_indices[0]
+        for row_index in row_indices[1:]:
+            if row_index == previous_index + 1:
+                previous_index = row_index
+                continue
+            spans.append((span_start, previous_index))
+            span_start = row_index
+            previous_index = row_index
+        spans.append((span_start, previous_index))
+        return spans
+
+    def _build_candidate_panel(source_panel: pd.DataFrame, span_start: int, span_end: int) -> dict[str, object]:
+        span_midpoint_index = (span_start + span_end) // 2
+        start = max(span_midpoint_index - points_per_panel // 2, 0)
+        stop = min(start + points_per_panel, len(source_panel))
+        if stop - start < points_per_panel:
+            start = max(stop - points_per_panel, 0)
+        panel = source_panel.iloc[start:stop].copy()
+
+        target_values = panel[target_flag].fillna(-1).astype(int)
+        avoid_labels_for_this_flag = avoid_context_set - {flag}
+        avoid_share = (
+            float(target_values.isin(avoid_labels_for_this_flag).mean())
+            if avoid_labels_for_this_flag
+            else 0.0
+        )
+        target_share = float((target_values == flag).mean())
+        measurement_share = float(panel[measurement_column].notna().mean()) if measurement_column in panel.columns else 0.0
+        secondary_share = (
+            float(panel[secondary_column].notna().mean())
+            if secondary_column and secondary_column in panel.columns
+            else 0.0
+        )
+        duration_seconds = 0.0
+        if len(panel) > 1:
+            duration_seconds = max(
+                0.0,
+                (panel["Time UTC"].max() - panel["Time UTC"].min()).total_seconds(),
+            )
+        average_gap_minutes = duration_seconds / max(len(panel) - 1, 1) / 60.0
+        target_position = (span_midpoint_index - start) / max(stop - start - 1, 1)
+        center_distance = abs(target_position - 0.5)
+
+        # Prefer dense, readable panels with measurement coverage and little
+        # unrelated missing-data context. This avoids "examples" where the
+        # requested label is technically present but most of the window is a
+        # long missing-data gap.
+        score = (
+            measurement_share * 3.0
+            + secondary_share * 0.5
+            + min(target_share, 0.25) * 2.0
+            - avoid_share * 6.0
+            - np.log1p(average_gap_minutes) * 0.8
+            - center_distance * 4.0
+        )
+        panel_start = panel["Time UTC"].min()
+        panel_end = panel["Time UTC"].max()
+        overlap_penalty = sum(
+            _window_overlap_share(panel_start, panel_end, used_start, used_end)
+            for used_start, used_end in used_panel_windows
+        )
+        score -= overlap_penalty * 8.0
+        return {
+            "panel": panel,
+            "example_time": source_panel.iloc[span_midpoint_index]["Time UTC"],
+            "center_row": source_panel.iloc[span_midpoint_index],
+            "score": float(score),
+            "avoid_context_share": avoid_share,
+            "target_label_share": target_share,
+            "measurement_available_share": measurement_share,
+            "average_gap_minutes": float(average_gap_minutes),
+            "target_position": float(target_position),
+        }
+
     for axis, flag in zip(axes, available_classes):
-        flag_rows = work.index[work[target_flag].fillna(-1).astype(int) == flag].tolist()
-        center_index = flag_rows[len(flag_rows) // 2]
-        center_row = work.loc[center_index]
-
-        # Keep the context panel inside the same source file when possible so a
-        # "local" example does not accidentally jump across large time gaps.
-        if "source_file" in work.columns and pd.notna(center_row.get("source_file")):
-            source_file = center_row["source_file"]
-            source_panel = work[work["source_file"] == source_file].sort_values("Time UTC").reset_index(drop=True)
+        source_groups = (
+            work.groupby("source_file", sort=False, observed=False)
+            if "source_file" in work.columns
+            else [(None, work)]
+        )
+        candidates = []
+        for _, source_frame in source_groups:
+            source_panel = source_frame.sort_values("Time UTC").reset_index(drop=True)
             source_flag_rows = source_panel.index[source_panel[target_flag].fillna(-1).astype(int) == flag].tolist()
-            if source_flag_rows:
-                source_center_index = source_flag_rows[len(source_flag_rows) // 2]
-                span_start_index = source_center_index
-                while span_start_index > 0 and int(source_panel.iloc[span_start_index - 1][target_flag]) == flag:
-                    span_start_index -= 1
-                span_end_index = source_center_index
-                while (
-                    span_end_index + 1 < len(source_panel)
-                    and int(source_panel.iloc[span_end_index + 1][target_flag]) == flag
-                ):
-                    span_end_index += 1
-
-                # Center the panel on the midpoint of the contiguous target span
-                # rather than on an arbitrary example row. This keeps the
-                # highlighted issue closer to the middle of the subplot.
-                span_midpoint_index = (span_start_index + span_end_index) // 2
-                start = max(span_midpoint_index - points_per_panel // 2, 0)
-                stop = min(start + points_per_panel, len(source_panel))
-                if stop - start < points_per_panel:
-                    start = max(stop - points_per_panel, 0)
-                panel = source_panel.iloc[start:stop].copy()
-                example_time = source_panel.iloc[span_midpoint_index]["Time UTC"]
-            else:
-                start = max(center_index - points_per_panel // 2, 0)
-                stop = min(start + points_per_panel, len(work))
-                panel = work.iloc[start:stop].copy()
-                example_time = center_row["Time UTC"]
-        else:
-            start = max(center_index - points_per_panel // 2, 0)
-            stop = min(start + points_per_panel, len(work))
-            panel = work.iloc[start:stop].copy()
-            example_time = center_row["Time UTC"]
+            for span_start_index, span_end_index in _contiguous_spans(source_flag_rows):
+                candidates.append(_build_candidate_panel(source_panel, span_start_index, span_end_index))
+        if not candidates:
+            raise ValueError(f"No requested class {flag} found in {target_flag}")
+        best_candidate = max(candidates, key=lambda candidate: candidate["score"])
+        panel = best_candidate["panel"]
+        example_time = best_candidate["example_time"]
+        center_row = best_candidate["center_row"]
+        used_panel_windows.append((panel["Time UTC"].min(), panel["Time UTC"].max()))
         panel_spans = _iter_flag_spans(panel, target_flag, good_labels=good_labels)
         flags_in_panel = sorted({span_flag for span_flag, _, _ in panel_spans})
 
@@ -2409,11 +2613,15 @@ def plot_flag_examples(
                     color=colors.get(flag, "#9467bd"),
                     s=20,
                     zorder=3,
-                    label=f"Rows with QC flag {flag}",
+                    label=f"Rows with {target_display_name} {flag}",
                 )
-        axis.set_title(f"Example around QC flag {flag}: {QC_FLAG_MEANINGS.get(flag, 'unknown')}")
+        axis.set_title(f"Example around {target_display_name} {flag}: {meaning_lookup.get(flag, 'unknown')}")
         axis.set_ylabel(measurement_column)
-        axis.grid(alpha=0.25)
+        axis.grid(False, which="both", axis="both")
+        axis.xaxis.grid(False, which="both")
+        axis.yaxis.grid(False, which="both")
+        for grid_line in [*axis.get_xgridlines(), *axis.get_ygridlines()]:
+            grid_line.set_visible(False)
 
         secondary_available = bool(
             secondary_column
@@ -2425,6 +2633,11 @@ def plot_flag_examples(
             twin_axis.plot(panel["Time UTC"], panel[secondary_column], color=temp_color, linewidth=1.2, alpha=0.6, label=secondary_column)
             twin_axis.set_ylabel(secondary_column, color=temp_color)
             twin_axis.tick_params(axis="y", colors=temp_color)
+            twin_axis.grid(False, which="both", axis="both")
+            twin_axis.xaxis.grid(False, which="both")
+            twin_axis.yaxis.grid(False, which="both")
+            for grid_line in [*twin_axis.get_xgridlines(), *twin_axis.get_ygridlines()]:
+                grid_line.set_visible(False)
 
         legend_handles = [
             Line2D([0], [0], color=line_color, linewidth=2, label=measurement_column),
@@ -2440,7 +2653,7 @@ def plot_flag_examples(
                     color="w",
                     markerfacecolor=colors.get(flag, "#9467bd"),
                     markersize=7,
-                    label=f"QC flag {flag} points",
+                    label=f"{target_display_name} {flag} points",
                 )
             )
         legend_handles.extend(
@@ -2449,7 +2662,7 @@ def plot_flag_examples(
                     facecolor=colors.get(span_flag, "#9467bd"),
                     edgecolor="none",
                     alpha=region_alpha,
-                    label=f"QC region {span_flag}: {QC_FLAG_MEANINGS.get(span_flag, 'unknown')}",
+                    label=f"{target_display_name} region {span_flag}: {meaning_lookup.get(span_flag, 'unknown')}",
                 )
                 for span_flag in flags_in_panel
             ]
@@ -2458,17 +2671,23 @@ def plot_flag_examples(
 
         example_rows.append(
             {
-                "qc_flag": flag,
-                "meaning": QC_FLAG_MEANINGS.get(flag, "unknown"),
+                "target_column": target_flag,
+                "target_label": flag,
+                "meaning": meaning_lookup.get(flag, "unknown"),
                 "panel_start": panel["Time UTC"].min(),
                 "panel_end": panel["Time UTC"].max(),
                 "example_time": example_time,
                 "source_file": clean_source_file_label(center_row["source_file"]) if "source_file" in work.columns else None,
+                "avoid_context_share": best_candidate["avoid_context_share"],
+                "target_label_share": best_candidate["target_label_share"],
+                "measurement_available_share": best_candidate["measurement_available_share"],
+                "average_gap_minutes": best_candidate["average_gap_minutes"],
+                "target_position": best_candidate["target_position"],
             }
         )
 
     axes[-1].set_xlabel("Time UTC")
-    fig.suptitle("Representative time-series examples for different QC flags", y=1.02)
+    fig.suptitle(f"Representative time-series examples for different {target_display_name} values", y=1.02)
     fig.tight_layout()
     return fig, pd.DataFrame(example_rows)
 
@@ -2480,6 +2699,8 @@ def plot_cluster_window_examples(
     measurement_column: str = "Conductivity (S/m)",
     secondary_column: str = "Temperature (C)",
     target_flag: str = "Conductivity QC Flag",
+    target_display_name: str = "target label",
+    label_meanings: dict[int, str] | None = None,
     good_labels: list[int] | tuple[int, ...] | None = None,
     examples_per_cluster: int = 1,
     context_points: int = 1500,
@@ -2492,10 +2713,10 @@ def plot_cluster_window_examples(
     Each panel now includes both:
 
     - the highlighted window that supplied one k-means example, and
-    - the true QC-flag regions from the underlying row-level data.
+    - the true target-label regions from the underlying row-level data.
 
     That makes it easier to see whether a cluster prototype lines up with known
-    flagged behavior or with apparently normal operating periods.
+    labelled behaviour or with apparently normal operating periods.
     """
     required_columns = {"cluster", "window_start", "window_end", "source_file", "distance_to_centroid", "issue_rate"}
     missing = required_columns.difference(clustered_window_df.columns)
@@ -2508,6 +2729,9 @@ def plot_cluster_window_examples(
         raise ValueError("No clusters found in clustered_window_df")
 
     palette = flag_palette or DEFAULT_FLAG_PALETTE
+    meaning_lookup = dict(QC_FLAG_MEANINGS)
+    if label_meanings:
+        meaning_lookup.update({int(label): str(meaning) for label, meaning in label_meanings.items()})
     cluster_colors = plt.cm.tab10(np.linspace(0, 1, len(cluster_ids)))
     cluster_palette = {cluster_id: cluster_colors[idx] for idx, cluster_id in enumerate(cluster_ids)}
 
@@ -2527,20 +2751,23 @@ def plot_cluster_window_examples(
     for axis, (_, row) in zip(axes, representative_rows.iterrows()):
         source_file = row["source_file"]
         row_part_path = Path(source_to_row_part[source_file])
-        panel = pd.read_parquet(
-            row_part_path,
-            columns=["Time UTC", measurement_column, secondary_column, target_flag],
-        ).sort_values("Time UTC").reset_index(drop=True)
-        panel["Time UTC"] = pd.to_datetime(panel["Time UTC"], utc=True)
-
         window_start = pd.to_datetime(row["window_start"], utc=True)
         window_end = pd.to_datetime(row["window_end"], utc=True)
         center_time = window_start + (window_end - window_start) / 2
-        time_delta = (panel["Time UTC"] - center_time).abs()
-        center_index = int(time_delta.idxmin())
-        start_index = max(center_index - context_points // 2, 0)
-        stop_index = min(start_index + context_points, len(panel))
-        context_panel = panel.iloc[start_index:stop_index].copy()
+        requested_columns = ["Time UTC", measurement_column, target_flag]
+        if secondary_column and secondary_column != measurement_column:
+            requested_columns.append(secondary_column)
+        context_panel = load_parquet_context_panel(
+            row_part_path,
+            center_time=center_time,
+            columns=requested_columns,
+            context_points=context_points,
+        )
+        if context_panel.empty:
+            raise ValueError(
+                f"Could not load a parquet context panel for source_file={source_file!r} "
+                f"around {center_time.isoformat()}."
+            )
 
         cluster_id = int(row["cluster"])
         cluster_color = cluster_palette[cluster_id]
@@ -2589,17 +2816,23 @@ def plot_cluster_window_examples(
         axis.set_ylabel(measurement_column)
         axis.grid(alpha=0.25)
 
-        twin_axis = axis.twinx()
-        twin_axis.plot(
-            context_panel["Time UTC"],
-            context_panel[secondary_column],
-            color="#059669",
-            linewidth=1.2,
-            alpha=0.65,
-            label=secondary_column,
+        has_secondary = (
+            secondary_column
+            and secondary_column != measurement_column
+            and secondary_column in context_panel.columns
         )
-        twin_axis.set_ylabel(secondary_column, color="#059669")
-        twin_axis.tick_params(axis="y", colors="#059669")
+        if has_secondary:
+            twin_axis = axis.twinx()
+            twin_axis.plot(
+                context_panel["Time UTC"],
+                context_panel[secondary_column],
+                color="#059669",
+                linewidth=1.2,
+                alpha=0.65,
+                label=secondary_column,
+            )
+            twin_axis.set_ylabel(secondary_column, color="#059669")
+            twin_axis.tick_params(axis="y", colors="#059669")
 
         axis.set_title(
             f"Cluster {cluster_id} example | issue rate={float(row['issue_rate']):.2f} | "
@@ -2608,7 +2841,6 @@ def plot_cluster_window_examples(
 
         legend_handles = [
             Line2D([0], [0], color="#0f172a", linewidth=2, label=measurement_column),
-            Line2D([0], [0], color="#059669", linewidth=2, label=secondary_column),
             Patch(
                 facecolor=cluster_color,
                 edgecolor="none",
@@ -2625,13 +2857,16 @@ def plot_cluster_window_examples(
                 label="Datapoints used inside that window",
             ),
         ]
+        if has_secondary:
+            legend_handles.insert(1, Line2D([0], [0], color="#059669", linewidth=2, label=secondary_column))
         for flag_value in sorted(shown_flag_labels):
+            label_text = meaning_lookup.get(flag_value, "labelled")
             legend_handles.append(
                 Patch(
                     facecolor=palette.get(flag_value, "#9ca3af"),
                     edgecolor="none",
                     alpha=flag_region_alpha,
-                    label=f"QC region {flag_value}: {QC_FLAG_MEANINGS.get(flag_value, 'flagged')}",
+                    label=f"{target_display_name} region {flag_value}: {label_text}",
                 )
             )
         axis.legend(handles=legend_handles, loc="upper left", frameon=True)
@@ -2905,7 +3140,7 @@ def build_sequence_split_bundle_from_frames(
 ) -> SequenceSplitBundle:
     """Build fixed-window sequence arrays from precomputed split frames.
 
-    This is the stricter benchmark path: the caller can define train/validation/
+    This is the stricter fixed-split path: the caller can define train/validation/
     test on the full reviewed dataset first, optionally subsample only the train
     split, and then turn those finalized splits into windows.
     """
