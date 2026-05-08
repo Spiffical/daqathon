@@ -39,7 +39,7 @@ Before you start, make sure you can:
 3. Install the shared kernel once:
 
    ```bash
-   jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
+   /project/def-kmoran/shared/daqathon/envs/daqathon-ml-venv/bin/jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
    ```
 
 4. Launch JupyterHub:

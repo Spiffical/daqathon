@@ -55,7 +55,7 @@ cd daqathon
 Each user needs to install the shared DAQathon kernel into their own account one time:
 
 ```bash
-jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
+/project/def-kmoran/shared/daqathon/envs/daqathon-ml-venv/bin/jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
 ```
 
 After that, the `Daqathon ML` kernel should appear in JupyterHub.
