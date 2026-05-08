@@ -16,7 +16,13 @@ By the end of Session 1, you should be able to:
 
 Before you start, make sure you can:
 
-1. SSH into FIR:
+1. SSH into Narval:
+
+   ```bash
+   ssh <username>@narval.alliancecan.ca
+   ```
+
+   FIR uses the same setup when it is available:
 
    ```bash
    ssh <username>@fir.alliancecan.ca
@@ -38,7 +44,9 @@ Before you start, make sure you can:
 
 4. Launch JupyterHub:
 
-   [https://jupyterhub.fir.alliancecan.ca/](https://jupyterhub.fir.alliancecan.ca/)
+   Narval: [https://jupyterhub.narval.alliancecan.ca/](https://jupyterhub.narval.alliancecan.ca/)
+
+   FIR: [https://jupyterhub.fir.alliancecan.ca/](https://jupyterhub.fir.alliancecan.ca/)
 
 5. Open the notebook from `~/daqathon/notebooks/` and choose the `Daqathon ML` kernel.
 
@@ -51,7 +59,7 @@ This is a practical, discussion-friendly flow for the first session. The exact t
 Estimated time: `10–15 min`
 
 - confirm everyone can open the repo and select the kernel,
-- explain where the shared data lives on FIR,
+- explain where the shared data lives on Narval/FIR,
 - explain where notebook outputs go,
 - and quickly orient everyone to the structure of the main notebook.
 

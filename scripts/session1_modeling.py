@@ -252,7 +252,7 @@ def stage_directory_into_runtime(
 ) -> dict[str, object]:
     """Copy a read-only source directory into a writable runtime directory.
 
-    This is used for FIR notebook runs where shared project storage is the
+    This is used for Narval/FIR notebook runs where shared project storage is the
     long-lived source of truth, but node-local job storage such as
     ``$SLURM_TMPDIR`` is much faster for interactive work.
     """

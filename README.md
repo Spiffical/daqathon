@@ -13,9 +13,20 @@ Suggested session flow:
 
 The first notebook is the main teaching notebook. The second is the advanced notebook for tuning, feature engineering, and deeper model comparisons.
 
-## Quick Start On FIR
+## Quick Start On Narval Or FIR
 
-### 1. SSH to FIR
+For the May 2026 workshop, use **Narval**. FIR uses the same shared directory
+layout when it is available again.
+
+### 1. SSH to the cluster
+
+Narval:
+
+```bash
+ssh <username>@narval.alliancecan.ca
+```
+
+FIR:
 
 ```bash
 ssh <username>@fir.alliancecan.ca
@@ -23,7 +34,7 @@ ssh <username>@fir.alliancecan.ca
 
 ### 2. Clone the repo into your `HOME` space
 
-Because this repository is public on GitHub, HTTPS clone is the simplest option on FIR:
+Because this repository is public on GitHub, HTTPS clone is the simplest option on the cluster:
 
 ```bash
 cd "$HOME"
@@ -31,7 +42,7 @@ git clone https://github.com/Spiffical/daqathon.git daqathon
 cd daqathon
 ```
 
-If you prefer GitHub SSH and already have your GitHub SSH key configured on FIR, use:
+If you prefer GitHub SSH and already have your GitHub SSH key configured on the cluster, use:
 
 ```bash
 cd "$HOME"
@@ -41,7 +52,7 @@ cd daqathon
 
 ### 3. Install the shared Jupyter kernel once
 
-Each FIR user needs to install the shared DAQathon kernel into their own account one time:
+Each user needs to install the shared DAQathon kernel into their own account one time:
 
 ```bash
 jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/daqathon-ml
@@ -49,15 +60,21 @@ jupyter kernelspec install --user /project/def-kmoran/shared/daqathon/kernels/da
 
 After that, the `Daqathon ML` kernel should appear in JupyterHub.
 
-### 4. Launch JupyterHub on FIR
+### 4. Launch JupyterHub
 
-Open:
+Narval:
+
+```text
+https://jupyterhub.narval.alliancecan.ca/
+```
+
+FIR:
 
 ```text
 https://jupyterhub.fir.alliancecan.ca/
 ```
 
-Start your JupyterHub environment there.
+Start your JupyterHub environment on the cluster you are using.
 
 ### 5. Open the notebooks from your cloned repo
 
@@ -80,7 +97,7 @@ This repo contains:
 - the runtime helper scripts used by the notebooks
 - the environment specification
 
-### In shared project space on FIR
+### In shared project space on Narval/FIR
 
 These shared resources live under:
 
@@ -128,7 +145,7 @@ Use `notebooks/advanced_session1_qc_workflow.ipynb` when you want to go further:
 
 ## Where Outputs Go
 
-The notebooks never write trained models or generated files back into the shared FIR data/cache.
+The notebooks never write trained models or generated files back into the shared project data/cache.
 
 Instead, notebook outputs go to a writable runtime directory chosen in this order:
 
@@ -146,7 +163,7 @@ That runtime output area is used for:
 
 ## Shared Cache Behavior
 
-On FIR, the notebooks treat the shared project space as the long-lived source of truth, but they stage fast local working copies when possible.
+On Alliance clusters, the notebooks treat the shared project space as the long-lived source of truth, but they stage fast local working copies when possible.
 
 That means:
 
@@ -168,7 +185,7 @@ You do not need the local notebook-builder or local experiment-study scripts for
 
 ## Local Development
 
-If you run this repo locally instead of on FIR:
+If you run this repo locally instead of on Narval/FIR:
 
 - the notebooks will still work
 - they will fall back to repo-local runtime output under `tmp/session1_outputs`
@@ -188,5 +205,5 @@ DAQathon/
 ## Notes
 
 - Start Jupyter from the cloned repo root.
-- Use the shared FIR kernel for the workshop notebooks.
+- Use the shared `Daqathon ML` kernel for the workshop notebooks.
 - Keep large datasets in shared project storage rather than copying them into your own repo clone.
