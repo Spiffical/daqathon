@@ -880,9 +880,12 @@ def write_cache_metadata(
 ) -> dict[str, object]:
     """Write metadata describing the row-level and window-level parquet cache."""
 
+    # Keep metadata portable. The notebooks resolve the active cache directory at
+    # runtime, so metadata should not preserve a build-machine absolute path.
     metadata = {
         "target_flag": target_flag,
-        "cache_root": str(bundle_paths.root),
+        "cache_root": ".",
+        "cache_path_base": "metadata_directory",
         "cache_stem": bundle_paths.stem,
         "measurement_columns": row_result.measurement_columns,
         "requested_measurement_columns": row_result.requested_measurement_columns or [],
@@ -901,8 +904,13 @@ def write_cache_metadata(
             else 0.0
         ),
         "processed_files": row_result.processed_files,
-        "row_level_cache": str(bundle_paths.row_level_dir),
-        "window_cache": str(bundle_paths.window_cache_path),
+        "part_to_source_file": {
+            Path(str(file_info["row_level_part"])).name: str(file_info["source_file"])
+            for file_info in row_result.processed_files
+        },
+        "row_level_cache": bundle_paths.row_level_dir.name,
+        "window_cache": bundle_paths.window_cache_path.name,
+        "metadata_path": bundle_paths.metadata_path.name,
         "row_columns": row_result.row_columns,
         "window_columns": window_result.window_columns,
         "device_file_counts": {device: len(infos) for device, infos in row_result.grouped_infos.items()},

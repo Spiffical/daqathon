@@ -178,10 +178,12 @@ If you choose to run the raw-to-parquet preparation step from inside a notebook,
 
 The notebooks import the following runtime helpers:
 
+- `scripts/session1_notebook_bootstrap.py`
+- `scripts/session1_intro_notebook_setup.py`
 - `scripts/prepare_scalar_session1_data.py`
+- `scripts/session1_intro_utils.py`
 - `scripts/session1_modeling.py`
-
-You do not need the local notebook-builder or local experiment-study scripts for the participant workflow.
+- `scripts/session1_resume_utils.py`
 
 ## Local Development
 

@@ -334,11 +334,14 @@ def csv_files_to_parquet_cache(
             }
         )
 
+    # Keep the cache metadata movable between laptops, clusters, and scratch
+    # directories. The caller already knows which cache directory is active.
     metadata: dict[str, object] = {
-        "cache_root": str(bundle_paths.root),
+        "cache_root": ".",
+        "cache_path_base": "metadata_directory",
         "cache_stem": bundle_paths.stem,
-        "row_level_cache": str(bundle_paths.row_level_dir),
-        "metadata_path": str(bundle_paths.metadata_path),
+        "row_level_cache": bundle_paths.row_level_dir.name,
+        "metadata_path": bundle_paths.metadata_path.name,
         "processed_file_count": len(processed_files),
         "row_count": int(total_rows),
         "sample_rows_per_file": sample_rows_per_file,
