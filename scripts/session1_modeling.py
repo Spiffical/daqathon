@@ -51,6 +51,10 @@ DEFAULT_CACHE_STEM = "scalar_session1"
 LEGACY_CACHE_STEMS = (DEFAULT_CACHE_STEM, "ctd_session1")
 CACHE_STEM_FALLBACKS = {
     "conductivity_scalar_session1": ("ctd_session1", DEFAULT_CACHE_STEM),
+    "fluorometer_scalar_session1": ("sogcentral_turbidity", "folger_turbidity"),
+    "sogcentral_turbidity": ("fluorometer_scalar_session1", "folger_turbidity"),
+    "oxygen_scalar_session1": ("sogcentral_oxygen", "folger_oxygen"),
+    "sogcentral_oxygen": ("oxygen_scalar_session1", "folger_oxygen"),
 }
 
 QC_FLAG_MEANINGS = {
