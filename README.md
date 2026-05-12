@@ -180,6 +180,8 @@ The notebooks import the following runtime helpers:
 
 - `scripts/session1_notebook_bootstrap.py`
 - `scripts/session1_intro_notebook_setup.py`
+- `scripts/session1_defaults.py`
+- `scripts/session1_profiles.py`
 - `scripts/prepare_scalar_session1_data.py`
 - `scripts/session1_intro_utils.py`
 - `scripts/session1_modeling.py`

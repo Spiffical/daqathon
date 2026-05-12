@@ -25,6 +25,17 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .session1_defaults import (
+    CACHE_STEM_FALLBACKS,
+    CTD_MEASUREMENT_COLUMNS,
+    DEFAULT_CACHE_STEM,
+    DEFAULT_FLAG_PALETTE,
+    DEFAULT_GOOD_LABELS,
+    DEFAULT_ISSUE_LABELS,
+    LEGACY_CACHE_STEMS,
+    QC_FLAG_MEANINGS,
+)
+
 try:
     import torch
     from torch import nn
@@ -35,56 +46,10 @@ except ImportError:  # pragma: no cover - optional dependency in some environmen
     DataLoader = None
     TensorDataset = None
 
-MEASUREMENT_COLUMNS = [
-    "Conductivity (S/m)",
-    "Density (kg/m3)",
-    "Depth (m)",
-    "Practical Salinity (psu)",
-    "Pressure (decibar)",
-    "Sigma-t (kg/m3)",
-    "Sigma-theta (0 dbar) (kg/m3)",
-    "Sound Speed (m/s)",
-    "Temperature (C)",
-]
+# Backward-compatible alias for older scripts that imported the CTD defaults
+# from this modelling module. New code should use the active dataset profile.
+MEASUREMENT_COLUMNS = CTD_MEASUREMENT_COLUMNS
 
-DEFAULT_CACHE_STEM = "scalar_session1"
-LEGACY_CACHE_STEMS = (DEFAULT_CACHE_STEM, "ctd_session1")
-CACHE_STEM_FALLBACKS = {
-    "conductivity_scalar_session1": ("ctd_session1", DEFAULT_CACHE_STEM),
-    "fluorometer_scalar_session1": ("sogcentral_turbidity", "folger_turbidity"),
-    "sogcentral_turbidity": ("fluorometer_scalar_session1", "folger_turbidity"),
-    "oxygen_scalar_session1": ("sogcentral_oxygen", "folger_oxygen"),
-    "sogcentral_oxygen": ("oxygen_scalar_session1", "folger_oxygen"),
-}
-
-QC_FLAG_MEANINGS = {
-    0: "no QC",
-    1: "good",
-    2: "probably good",
-    3: "probably bad",
-    4: "bad",
-    6: "bad down-sampling",
-    7: "averaged",
-    8: "interpolated",
-    9: "missing / NaN",
-}
-
-DEFAULT_FLAG_PALETTE = {
-    0: "#94a3b8",
-    1: "#1f77b4",
-    2: "#60a5fa",
-    3: "#ff7f0e",
-    4: "#d62728",
-    6: "#8b5cf6",
-    7: "#14b8a6",
-    8: "#a855f7",
-    9: "#7f7f7f",
-    12: "#2563eb",
-    34: "#e76f51",
-}
-
-DEFAULT_GOOD_LABELS = (1,)
-DEFAULT_ISSUE_LABELS = (3, 4, 9)
 SUPPORTED_SPLIT_STRATEGIES = (
     "global_contiguous",
     "per_source_contiguous",

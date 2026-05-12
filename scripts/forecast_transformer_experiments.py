@@ -26,51 +26,29 @@ from scripts.session1_modeling import (
     load_full_row_level_frame,
     split_frame_by_strategy,
 )
+from scripts.session1_profiles import DATASET_PROFILES as SESSION1_DATASET_PROFILES
 
 
-DATASET_PROFILES = {
+FORECAST_DATASET_PROFILES = {
     "conductivity_plugs": {
-        "cache_stem": "conductivity_plugs_session1",
-        "target_flag": "ml_label",
-        "task_mode": "multiclass",
-        "good_labels": [0],
-        "issue_labels": [1, 2, 3, 4],
+        "cache_stem": SESSION1_DATASET_PROFILES["conductivity_plugs"]["cache_stem"],
+        "target_flag": SESSION1_DATASET_PROFILES["conductivity_plugs"]["target_flag"],
+        "task_mode": SESSION1_DATASET_PROFILES["conductivity_plugs"]["task_mode"],
+        "good_labels": SESSION1_DATASET_PROFILES["conductivity_plugs"]["good_labels"],
+        "issue_labels": SESSION1_DATASET_PROFILES["conductivity_plugs"]["issue_labels"],
         "target_column": "cond_value_ctd",
-        "measurement_columns": [
-            "cond_value_ctd",
-            "density_value_ctd",
-            "Pressure_value_ctd",
-            "salinity_value_ctd",
-            "sigmaT_value_ctd",
-            "SIGMA_THETA_value_ctd",
-            "Sound_Speed_value_ctd",
-            "Temperature_value_ctd",
-            "oxygen_corrected_value_oxy",
-            "oxygen_uncorrected_value_oxy",
-            "temperature_value_oxy",
-            "temperature_offset",
-            "temperature_offset_anomaly",
-            "temperature_offset_over_start_mean",
-        ],
+        "measurement_columns": SESSION1_DATASET_PROFILES["conductivity_plugs"]["measurement_columns"],
     },
     "ctd_conductivity": {
+        # Keep the legacy experiment cache name until old local experiment
+        # outputs are rebuilt. The notebook profile uses the newer stem.
         "cache_stem": "ctd_session1",
-        "target_flag": "Conductivity QC Flag",
-        "task_mode": "multiclass",
-        "good_labels": [1],
-        "issue_labels": [3, 4, 9],
+        "target_flag": SESSION1_DATASET_PROFILES["ctd_conductivity"]["target_flag"],
+        "task_mode": SESSION1_DATASET_PROFILES["ctd_conductivity"]["task_mode"],
+        "good_labels": SESSION1_DATASET_PROFILES["ctd_conductivity"]["good_labels"],
+        "issue_labels": SESSION1_DATASET_PROFILES["ctd_conductivity"]["issue_labels"],
         "target_column": "Conductivity (S/m)",
-        "measurement_columns": [
-            "Conductivity (S/m)",
-            "Density (kg/m3)",
-            "Depth (m)",
-            "Practical Salinity (psu)",
-            "Pressure (decibar)",
-            "Sigma-t (kg/m3)",
-            "Sigma-theta (0 dbar) (kg/m3)",
-            "Sound Speed (m/s)",
-            "Temperature (C)",
-        ],
+        "measurement_columns": SESSION1_DATASET_PROFILES["ctd_conductivity"]["measurement_columns"],
     },
 }
 
@@ -680,7 +658,7 @@ def build_experiment_configs(preset: str) -> list[ExperimentConfig]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run local next-value transformer anomaly experiments.")
-    parser.add_argument("--dataset", choices=sorted(DATASET_PROFILES), default="conductivity_plugs")
+    parser.add_argument("--dataset", choices=sorted(FORECAST_DATASET_PROFILES), default="conductivity_plugs")
     parser.add_argument("--cache-root", type=Path, default=Path("data/cache/session1"))
     parser.add_argument("--data-fraction", type=float, default=0.9)
     parser.add_argument("--preset", choices=["quick", "extended"], default="quick")
@@ -688,7 +666,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/forecast_transformer_experiments"))
     args = parser.parse_args()
 
-    profile = DATASET_PROFILES[args.dataset]
+    profile = FORECAST_DATASET_PROFILES[args.dataset]
     row_dir = args.cache_root / f"{profile['cache_stem']}_row_level"
     part_paths = sorted(row_dir.glob("*.parquet"))
     if not part_paths:

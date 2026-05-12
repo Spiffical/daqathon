@@ -27,6 +27,21 @@ from pathlib import Path
 
 import pandas as pd
 
+try:
+    from .session1_defaults import (
+        CTD_MEASUREMENT_COLUMNS,
+        DEFAULT_CACHE_STEM,
+        DEFAULT_ISSUE_LABELS,
+        PREFERRED_SCALAR_MEASUREMENT_COLUMNS,
+    )
+except ImportError:  # pragma: no cover - supports direct CLI execution
+    from session1_defaults import (  # type: ignore
+        CTD_MEASUREMENT_COLUMNS,
+        DEFAULT_CACHE_STEM,
+        DEFAULT_ISSUE_LABELS,
+        PREFERRED_SCALAR_MEASUREMENT_COLUMNS,
+    )
+
 DEVICE_PATTERNS = {
     "ctd": "ConductivityTemperatureDepth",
     "fluorometer": "Fluorometer",
@@ -35,32 +50,8 @@ DEVICE_PATTERNS = {
 
 FILENAME_TIME_RANGE_RE = re.compile(r"_(\d{8}T\d{6}(?:\.\d+)?Z)_(\d{8}T\d{6}(?:\.\d+)?Z)(?:-NaN)?\.csv$")
 
-DEFAULT_CACHE_STEM = "scalar_session1"
-DEFAULT_ISSUE_LABELS = [3, 4, 9]
-
-DEFAULT_MEASUREMENT_COLUMNS = [
-    "Conductivity (S/m)",
-    "Density (kg/m3)",
-    "Depth (m)",
-    "Practical Salinity (psu)",
-    "Pressure (decibar)",
-    "Sigma-t (kg/m3)",
-    "Sigma-theta (0 dbar) (kg/m3)",
-    "Sound Speed (m/s)",
-    "Temperature (C)",
-]
-
-PREFERRED_MEASUREMENT_COLUMNS = [
-    *DEFAULT_MEASUREMENT_COLUMNS,
-    "Chlorophyll (ug/l)",
-    "Fluorescence (mg/m3)",
-    "Turbidity (NTU)",
-    "Oxygen Concentration Corrected (ml/l)",
-    "Oxygen Concentration Uncorrected (ml/l)",
-    "Dissolved Oxygen (mL/L)",
-    "Dissolved Oxygen (umol/L)",
-    "Oxygen Saturation (%)",
-]
+DEFAULT_MEASUREMENT_COLUMNS = list(CTD_MEASUREMENT_COLUMNS)
+PREFERRED_MEASUREMENT_COLUMNS = list(PREFERRED_SCALAR_MEASUREMENT_COLUMNS)
 
 
 @dataclass(frozen=True)
