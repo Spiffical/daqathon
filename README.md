@@ -4,14 +4,14 @@ This repository contains the participant materials for DAQathon Session 1 at Oce
 
 The two main notebooks are:
 
-- `notebooks/intro_session1_qc_workflow.ipynb`
-- `notebooks/advanced_session1_qc_workflow.ipynb`
+- `notebooks/session1_data_preparation.ipynb`
+- `notebooks/session1_machine_learning.ipynb`
 
 Suggested session flow:
 
 - [Session 1 agenda](./docs/session1_agenda.md)
 
-The first notebook is the main teaching notebook. The second is the advanced notebook for tuning, feature engineering, and deeper model comparisons.
+Start with the data-preparation notebook when you want to understand or rebuild the parquet cache. Use the machine-learning notebook for the Random Forest, k-means, CNN, and transformer sections.
 
 ## Quick Start On Narval Or FIR
 
@@ -120,28 +120,22 @@ Participants should treat the shared data and cache as read-only defaults.
 
 ## Which Notebook Should I Use?
 
-### Main notebook
+### Data preparation notebook
 
-Use `notebooks/intro_session1_qc_workflow.ipynb` when you want the guided Session 1 workflow:
+Use `notebooks/session1_data_preparation.ipynb` when you want to understand or rebuild the prepared parquet cache:
 
 - dataset orientation
 - QC flags in context
 - raw CSV to parquet preparation
+
+### Machine learning notebook
+
+Use `notebooks/session1_machine_learning.ipynb` when you want to run the modelling workflow:
+
 - Random Forest baseline
 - k-means clustering
 - baseline CNN
 - transformer introduction
-
-### Advanced notebook
-
-Use `notebooks/advanced_session1_qc_workflow.ipynb` when you want to go further:
-
-- hyperparameter search
-- feature engineering
-- stronger tree models
-- alternative target definitions
-- sequence-labeling CNN
-- deeper neural-network experiments
 
 ## Where Outputs Go
 

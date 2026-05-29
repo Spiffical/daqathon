@@ -169,33 +169,32 @@ Estimated time: `10–15 min`
 
 - review what changed most when the input representation changed,
 - review how target choice affects model behavior,
-- and point toward the advanced notebook for search, feature engineering, and stronger sequence models.
+- and point toward follow-up experiments for search, feature engineering, and stronger sequence models.
 
 Primary notebook sections:
 
 - `Part 8 — Reflection and Next Steps`
-- `notebooks/advanced_session1_qc_workflow.ipynb`
+- `notebooks/session1_machine_learning.ipynb`
 
 ## How The Two Notebooks Fit Together
 
-### Main notebook
+### Data preparation notebook
 
-Use [intro_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/intro_session1_qc_workflow.ipynb) for the first session:
+Use [session1_data_preparation.ipynb](/home/sbialek/ONC/DAQathon/notebooks/session1_data_preparation.ipynb) when you want to understand or rebuild the prepared parquet cache:
 
 - explore the data,
 - understand the prep workflow,
-- build the first baseline models,
-- and leave with good questions.
+- create row-level parquet from raw CSV files,
+- and inspect the prepared cache.
 
-### Advanced notebook
+### Machine learning notebook
 
-Use [advanced_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/advanced_session1_qc_workflow.ipynb) when you want to go deeper:
+Use [session1_machine_learning.ipynb](/home/sbialek/ONC/DAQathon/notebooks/session1_machine_learning.ipynb) when you want to run the modelling workflow:
 
-- hyperparameter search,
-- richer feature engineering,
-- stronger tree models,
-- target redesign,
-- and sequence-labeling experiments.
+- load a prepared parquet cache,
+- build train/validation/test splits,
+- run Random Forest and k-means examples,
+- and compare CNN and transformer sequence models.
 
 ## If You Have Extra Time
 
