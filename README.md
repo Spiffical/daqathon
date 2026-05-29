@@ -2,16 +2,17 @@
 
 This repository contains the participant materials for DAQathon Session 1 at Ocean Networks Canada.
 
-The two main notebooks are:
+The main notebooks are:
 
 - `notebooks/session1_data_preparation.ipynb`
 - `notebooks/session1_machine_learning.ipynb`
+- `notebooks/advanced_session1_qc_workflow.ipynb`
 
 Suggested session flow:
 
 - [Session 1 agenda](./docs/session1_agenda.md)
 
-Start with the data-preparation notebook when you want to understand or rebuild the parquet cache. Use the machine-learning notebook for the Random Forest, k-means, CNN, and transformer sections.
+Start with the data-preparation notebook when you want to understand or rebuild the parquet cache. Use the machine-learning notebook for the Random Forest, k-means, CNN, and transformer sections. Use the advanced notebook for deeper experiments after the main workflow.
 
 ## Quick Start On Narval Or FIR
 
@@ -92,7 +93,7 @@ Launch the notebooks from inside the cloned repo so the helper imports work corr
 
 This repo contains:
 
-- the two notebooks
+- the notebooks
 - plotting and lesson assets
 - the runtime helper scripts used by the notebooks
 - the environment specification
@@ -136,6 +137,16 @@ Use `notebooks/session1_machine_learning.ipynb` when you want to run the modelli
 - k-means clustering
 - baseline CNN
 - transformer introduction
+
+### Advanced notebook
+
+Use `notebooks/advanced_session1_qc_workflow.ipynb` when you want to go deeper:
+
+- hyperparameter search
+- feature engineering
+- stronger tree models
+- alternative target definitions
+- sequence-labeling experiments
 
 ## Where Outputs Go
 

@@ -169,14 +169,14 @@ Estimated time: `10–15 min`
 
 - review what changed most when the input representation changed,
 - review how target choice affects model behavior,
-- and point toward follow-up experiments for search, feature engineering, and stronger sequence models.
+- and point toward the advanced notebook for search, feature engineering, and stronger sequence models.
 
 Primary notebook sections:
 
 - `Part 8 — Reflection and Next Steps`
-- `notebooks/session1_machine_learning.ipynb`
+- `notebooks/advanced_session1_qc_workflow.ipynb`
 
-## How The Two Notebooks Fit Together
+## How The Notebooks Fit Together
 
 ### Data preparation notebook
 
@@ -195,6 +195,15 @@ Use [session1_machine_learning.ipynb](/home/sbialek/ONC/DAQathon/notebooks/sessi
 - build train/validation/test splits,
 - run Random Forest and k-means examples,
 - and compare CNN and transformer sequence models.
+
+### Advanced notebook
+
+Use [advanced_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/advanced_session1_qc_workflow.ipynb) when you want to go deeper:
+
+- tune model settings,
+- experiment with feature engineering,
+- compare stronger model variants,
+- and extend the sequence-model examples.
 
 ## If You Have Extra Time
 
