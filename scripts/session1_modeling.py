@@ -25,7 +25,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .session1_defaults import (
+from workshop_config.session1_defaults import (
     CACHE_STEM_FALLBACKS,
     CTD_MEASUREMENT_COLUMNS,
     DEFAULT_CACHE_STEM,
@@ -458,6 +458,10 @@ def sample_frame_by_strategy(
     - when creating a lightweight inspection sample from the cache, and
     - when shrinking only the training split in the fixed-split modelling flow.
 
+    ``rows_limit`` is the maximum number of rows to return. Use ``None`` to
+    keep the full input frame. The sampling strategy controls which rows are
+    kept when the input frame is larger than that limit.
+
     ``balanced_issue_share`` is only used by ``balanced_reviewed``. It sets a
     target fraction of reviewed rows that should come from issue labels. If the
     full training split has too few issue rows to hit that target, the sampler
@@ -748,7 +752,9 @@ def build_reviewed_target_frame(
 
     This lighter-weight helper is useful before split selection, when the
     notebook only needs label semantics and timestamps rather than the full
-    tabular feature set.
+    tabular feature set. ``model_row_limit`` is an optional maximum number of
+    reviewed rows to keep before modelling; use ``None`` to keep every reviewed
+    row in the input dataframe.
     """
 
     work = df.copy()
@@ -1886,6 +1892,7 @@ def select_time_range(
     auto_select: bool = True,
     max_points: int = 800,
     preferred_labels: tuple[int, ...] = (4, 3, 9),
+    max_duration: str | pd.Timedelta | None = "6h",
 ) -> dict[str, object]:
     """Choose either an explicit or representative interval for a notebook demo."""
     work = reference_frame.dropna(subset=[time_column]).sort_values(time_column).reset_index(drop=True).copy()
@@ -1940,6 +1947,21 @@ def select_time_range(
     stop_index = min(start_index + point_count, len(work))
     start_index = max(stop_index - point_count, 0)
     selected = work.iloc[start_index:stop_index].copy().reset_index(drop=True)
+    if max_duration is not None and not selected.empty:
+        duration = pd.Timedelta(max_duration)
+        center_time = work.loc[chosen_index, time_column]
+        duration_slice = work[
+            (work[time_column] >= center_time - duration / 2)
+            & (work[time_column] <= center_time + duration / 2)
+        ].copy()
+        if not duration_slice.empty:
+            selected = duration_slice.reset_index(drop=True)
+            if len(selected) > max_points:
+                center_position = len(selected) // 2
+                start_index = max(center_position - point_count // 2, 0)
+                stop_index = min(start_index + point_count, len(selected))
+                start_index = max(stop_index - point_count, 0)
+                selected = selected.iloc[start_index:stop_index].reset_index(drop=True)
 
     return {
         "start": selected[time_column].min(),
@@ -2719,7 +2741,18 @@ def plot_cluster_window_examples(
     example_records = []
     for axis, (_, row) in zip(axes, representative_rows.iterrows()):
         source_file = row["source_file"]
-        row_part_path = Path(source_to_row_part[source_file])
+        row_part_value = source_to_row_part.get(str(source_file))
+        if row_part_value is None:
+            row_part_value = source_to_row_part.get(clean_source_file_label(str(source_file)))
+        if row_part_value is None:
+            row_part_value = source_to_row_part.get(Path(str(source_file)).name)
+        if row_part_value is None:
+            available_sources = list(source_to_row_part)[:5]
+            raise KeyError(
+                f"Could not find the row-level parquet part for source_file={source_file!r}. "
+                f"Example available source keys: {available_sources}"
+            )
+        row_part_path = Path(row_part_value)
         window_start = pd.to_datetime(row["window_start"], utc=True)
         window_end = pd.to_datetime(row["window_end"], utc=True)
         center_time = window_start + (window_end - window_start) / 2

@@ -172,15 +172,34 @@ def load_ml_section_state(
     seed: int = 21,
     read_raw_data_dir: str | Path | None = None,
     read_cache_dir: str | Path | None = None,
+    raw_csv_dir: str | Path | None = None,
+    raw_csv_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
+    parquet_cache_dir: str | Path | None = None,
+    cache_bundle_name: str | None = None,
+    target_flag: str | None = None,
+    measurement_columns: list[str] | tuple[str, ...] | None = None,
+    optional_qc_columns: list[str] | tuple[str, ...] | None = None,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
+    plot_measurement_column: str | None = None,
+    plot_secondary_column: str | None = None,
+    primary_device: str | None = None,
+    kmeans_feature_mode: str | None = None,
+    csv_header: str | int = "auto",
+    time_column: str = "Time UTC",
+    build_cache_if_missing: bool = False,
+    force_rebuild_cache: bool = False,
+    generic_csv_cache: bool | None = None,
     verbose: bool = True,
 ) -> dict[str, object]:
     """Rebuild the objects needed to start any ML section after a skipped run.
 
-    The returned dictionary is meant to be applied with ``globals().update(...)``
-    in a notebook cell. It restores the common imports, dataset preset choices,
-    cache paths, selected reviewed modelling rows, train/validation/test frames,
-    train-only subset, and dataset-specific label-display variables used by the
-    Random Forest, k-means, CNN, and Transformer sections.
+    The returned dictionary is intentionally explicit: notebooks can store it as
+    ``ML_STATE`` and then assign the specific variables they need. It restores
+    the common imports, dataset preset choices, cache paths, selected reviewed
+    modelling rows, train/validation/test frames, train-only subset, and
+    dataset-specific label-display variables used by the Random Forest,
+    k-means, CNN, and Transformer sections.
 
     Most workshop runs only need to adjust the dataset preset,
     ``data_fraction``, split strategy, and train-subset strategy.
@@ -189,10 +208,14 @@ def load_ml_section_state(
     example, ``0.1`` gives a quick 10% reviewed-row run and ``0.9`` gives a
     much larger 90% reviewed-row run. Use ``1.0`` to remove row caps.
 
-    Set ``use_data_fraction_budgets=False`` to keep every reviewed row and
-    remove the per-section row/window caps. The lower-level row/file limits are
-    still available for custom runs, but they do not need to appear in the
-    participant-facing skip-ahead cells.
+    Set ``use_data_fraction_budgets=False`` to keep every reviewed row for the
+    setup-time dataset and train-subset steps. Model-specific row/window caps
+    are intentionally defined in the notebook section that uses each model.
+
+    Custom-data runs can pass ``raw_csv_dir`` or ``raw_csv_paths`` plus
+    ``target_flag`` and ``measurement_columns``. If ``build_cache_if_missing``
+    is true, the helper will create a simple row-level parquet cache when the
+    requested cache bundle is not already present.
     """
 
     if dataset_profile_id not in DATASET_PROFILES:
@@ -216,17 +239,8 @@ def load_ml_section_state(
     train_subset_min_rows = 10_000
     issue_rows_per_file_base = 12_000
     issue_rows_per_file_min = 1_000
-    rf_train_base_rows = 250_000
-    rf_train_min_rows = 25_000
-    rf_eval_base_rows = 150_000
-    rf_eval_min_rows = 15_000
-    kmeans_window_base_rows = 5_000
-    kmeans_window_min_rows = 2_000
-    search_model_base_rows = 500_000
-    search_model_min_rows = 200_000
-
     if use_data_fraction_budgets and data_fraction < 0.999:
-        budget_mode = "DATA_FRACTION row/window caps"
+        budget_mode = "DATA_FRACTION dataset/split caps"
         budget_data_fraction = data_fraction
 
         def scaled(base_rows: int, minimum_rows: int) -> int:
@@ -234,23 +248,11 @@ def load_ml_section_state(
 
         computed_train_subset_max_rows = scaled(train_subset_base_rows, train_subset_min_rows)
         computed_issue_rows_per_file = scaled(issue_rows_per_file_base, issue_rows_per_file_min)
-        rf_train_max_rows = scaled(rf_train_base_rows, rf_train_min_rows)
-        rf_validation_max_rows = scaled(rf_eval_base_rows, rf_eval_min_rows)
-        rf_test_max_rows = scaled(rf_eval_base_rows, rf_eval_min_rows)
-        kmeans_window_limit = scaled(kmeans_window_base_rows, kmeans_window_min_rows)
-        rf_search_model_row_limit = scaled(search_model_base_rows, search_model_min_rows)
-        cnn_search_model_row_limit = scaled(search_model_base_rows, search_model_min_rows)
     else:
-        budget_mode = "full reviewed data / no row caps"
+        budget_mode = "full reviewed data / no dataset row caps"
         budget_data_fraction = 1.0
         computed_train_subset_max_rows = None
         computed_issue_rows_per_file = issue_rows_per_file_base
-        rf_train_max_rows = None
-        rf_validation_max_rows = None
-        rf_test_max_rows = None
-        kmeans_window_limit = None
-        rf_search_model_row_limit = None
-        cnn_search_model_row_limit = None
 
     if train_subset_max_rows is None:
         train_subset_max_rows = computed_train_subset_max_rows
@@ -260,24 +262,50 @@ def load_ml_section_state(
     raw_dir, cache_dir, shared_daqathon_root, shared_cache_dir = _resolve_profile_paths(
         notebook_root=repo_root,
         profile=profile,
-        read_raw_data_dir=read_raw_data_dir,
-        read_cache_dir=read_cache_dir,
+        read_raw_data_dir=raw_csv_dir or read_raw_data_dir,
+        read_cache_dir=parquet_cache_dir or read_cache_dir,
     )
 
-    target_flag = str(profile["target_flag"])
+    custom_label_groups = good_labels is not None or issue_labels is not None
+    target_flag = str(target_flag or profile["target_flag"])
     task_mode = str(profile["task_mode"])
-    good_labels = [int(label) for label in profile.get("good_labels", [1])]
-    issue_labels = [int(label) for label in profile.get("issue_labels", [3, 4, 9])]
-    flag_example_classes = tuple(int(label) for label in profile.get("flag_example_classes", issue_labels))
-    cache_bundle_name = str(profile["cache_stem"])
+    good_labels = [
+        int(label)
+        for label in (
+            profile.get("good_labels", [1])
+            if good_labels is None
+            else good_labels
+        )
+    ]
+    issue_labels = [
+        int(label)
+        for label in (
+            profile.get("issue_labels", [3, 4, 9])
+            if issue_labels is None
+            else issue_labels
+        )
+    ]
+    flag_example_source = [*good_labels, *issue_labels] if custom_label_groups else profile.get("flag_example_classes", issue_labels)
+    flag_example_classes = tuple(int(label) for label in flag_example_source)
+    cache_bundle_name = str(cache_bundle_name or profile["cache_stem"])
     label_display_context = build_label_display_context(
         dataset_profile_id=dataset_profile_id,
         target_flag=target_flag,
     )
-    measurement_columns = list(profile["measurement_columns"])
-    optional_qc_columns = list(dict.fromkeys(profile["optional_qc_columns"]))
-    plot_measurement_column = str(profile["plot_measurement_column"])
-    plot_secondary_column = str(profile["plot_secondary_column"])
+    measurement_columns = list(profile["measurement_columns"] if measurement_columns is None else measurement_columns)
+    optional_qc_columns = list(
+        dict.fromkeys(profile["optional_qc_columns"] if optional_qc_columns is None else optional_qc_columns)
+    )
+    plot_measurement_column = str(plot_measurement_column or profile["plot_measurement_column"])
+    plot_secondary_column_value = (
+        profile["plot_secondary_column"]
+        if plot_secondary_column is None
+        else plot_secondary_column
+    )
+    plot_secondary_column = None if plot_secondary_column_value is None else str(plot_secondary_column_value)
+    primary_device = str(primary_device or profile["primary_device"])
+    requested_kmeans_feature_mode = kmeans_feature_mode
+    kmeans_feature_mode = str(requested_kmeans_feature_mode or profile["kmeans_feature_mode"])
 
     namespace = build_intro_notebook_namespace(
         notebook_root=repo_root,
@@ -293,6 +321,35 @@ def load_ml_section_state(
     runtime_cache_dir = Path(namespace["RUNTIME_CACHE_DIR"])
     read_raw_path = Path(raw_dir)
     read_cache_path = Path(cache_dir)
+    if generic_csv_cache is None:
+        generic_csv_cache = raw_csv_dir is not None or raw_csv_paths is not None
+    if generic_csv_cache and requested_kmeans_feature_mode is None:
+        kmeans_feature_mode = "row_level"
+
+    prebuilt_cache_paths = session1_intro_utils.choose_cache_bundle_paths(
+        [read_cache_path],
+        cache_stem=cache_bundle_name,
+    )
+    if force_rebuild_cache or (build_cache_if_missing and not prebuilt_cache_paths.metadata_path.exists()):
+        cache_build_result = session1_intro_utils.resolve_or_create_parquet_cache(
+            cache_root=read_cache_path,
+            cache_bundle_name=cache_bundle_name,
+            raw_data_dir=raw_dir,
+            raw_csv_paths=raw_csv_paths,
+            target_flag=target_flag,
+            measurement_columns=measurement_columns,
+            optional_qc_columns=optional_qc_columns,
+            issue_labels=issue_labels,
+            time_column=time_column,
+            csv_header=csv_header,
+            build_cache_if_missing=build_cache_if_missing,
+            force_rebuild_cache=force_rebuild_cache,
+            generic_csv_cache=bool(generic_csv_cache),
+            primary_device=primary_device,
+            sample_rows=None,
+        )
+        if verbose:
+            show_setup_json(cache_build_result["summary"])
 
     active_raw_data_dir = (
         runtime_raw_data_dir
@@ -323,8 +380,25 @@ def load_ml_section_state(
         limit=reviewed_file_limit,
         mode=reviewed_file_selection_mode,
     )
-    part_to_source = metadata.get("part_to_source_file", {})
-    source_to_row_part = {source: part for part, source in part_to_source.items()}
+    processed_files = metadata.get("processed_files", [])
+    part_to_source = {
+        Path(str(file_info["row_level_part"])).name: str(file_info["source_file"])
+        for file_info in processed_files
+        if "row_level_part" in file_info and "source_file" in file_info
+    }
+    part_to_source.update(
+        {
+            str(part_name): str(source_file)
+            for part_name, source_file in metadata.get("part_to_source_file", {}).items()
+        }
+    )
+    source_to_row_part = {
+        str(file_info["source_file"]): row_cache_dir / Path(str(file_info["row_level_part"])).name
+        for file_info in processed_files
+        if "row_level_part" in file_info and "source_file" in file_info
+    }
+    for part_name, source_file in part_to_source.items():
+        source_to_row_part.setdefault(str(source_file), row_cache_dir / Path(part_name).name)
     selected_source_files = [
         part_to_source.get(path.name, path.name.replace(".parquet", ".csv"))
         for path in selected_paths
@@ -375,7 +449,6 @@ def load_ml_section_state(
                 .sort_values("window_start")
                 .reset_index(drop=True)
             )
-            window_df = evenly_spaced_take(window_df, kmeans_window_limit, time_column="window_start")
     source_rows = len(reviewed_label_source_df)
     reviewed_label_df, _ = session1_modeling.build_reviewed_target_frame(
         reviewed_label_source_df,
@@ -429,6 +502,44 @@ def load_ml_section_state(
         balanced_issue_share=balanced_reviewed_target_issue_share,
     )
 
+    is_custom_dataset = dataset_profile_id == "custom" or any(
+        value is not None
+        for value in [raw_csv_dir, raw_csv_paths, parquet_cache_dir]
+    )
+    dataset_config = {
+        "DATASET_PROFILES": DATASET_PROFILES,
+        "DATASET_PROFILE_ID": dataset_profile_id,
+        "DATASET_PROFILE": profile,
+        "DATASET_LABEL": profile["label"],
+        "IS_CUSTOM_DATASET": is_custom_dataset,
+        "READ_RAW_DATA_DIR": str(raw_dir),
+        "READ_CACHE_DIR": str(cache_dir),
+        "RAW_CSV_PATHS": [str(path) for path in (raw_csv_paths or [])],
+        "TIME_COLUMN": time_column,
+        "CSV_HEADER": csv_header,
+        "TARGET_FLAG": target_flag,
+        "TASK_MODE": task_mode,
+        "GOOD_LABELS": good_labels,
+        "ISSUE_LABELS": issue_labels,
+        "FLAG_EXAMPLE_CLASSES": flag_example_classes,
+        "CACHE_BUNDLE_NAME": cache_bundle_name,
+        "PRIMARY_DEVICE": primary_device,
+        "KMEANS_FEATURE_MODE": kmeans_feature_mode,
+        "DEFAULT_SEQUENCE_OUTPUT_MODE": profile.get("default_sequence_output_mode", "window"),
+        "DEFAULT_SEQUENCE_TARGET_STRATEGY": profile.get("default_sequence_target_strategy", "collapsed_1_34_9"),
+        "RAW_CACHE_READ_SAMPLE_ROWS": profile.get("cache_read_sample_rows"),
+        "AUTO_BUILD_MISSING_CACHE": bool(profile.get("auto_build_missing_cache", True)),
+        "DEFAULT_PREP_SAMPLE_ROWS": profile.get("default_prep_sample_rows"),
+        "MEASUREMENT_COLUMNS": measurement_columns,
+        "OPTIONAL_QC_COLUMNS": optional_qc_columns,
+        "PLOT_MEASUREMENT_COLUMN": plot_measurement_column,
+        "PLOT_SECONDARY_COLUMN": plot_secondary_column,
+        "ROW_USE_COLUMNS": row_use_columns,
+        "WINDOW_FEATURE_COLUMNS": window_feature_columns,
+        "WINDOW_USE_COLUMNS": window_use_columns,
+        **label_display_context,
+    }
+
     setup_summary = {
         "DATASET_PROFILE_ID": dataset_profile_id,
         "DATA_FRACTION": data_fraction,
@@ -440,16 +551,23 @@ def load_ml_section_state(
         "ROW_CACHE_DIR": str(row_cache_dir),
         "WINDOW_CACHE_PATH": str(window_cache_path),
         "selected_cache_parts": len(selected_paths),
+        "reviewed_file_selection_mode": reviewed_file_selection_mode,
+        "reviewed_file_limit": reviewed_file_limit,
         "source_rows": source_rows,
         "reviewed_rows_before_limit": reviewed_source_rows,
         "reviewed_model_row_limit": reviewed_model_row_limit,
         "reviewed_model_rows": len(reviewed_model_df),
         "split_strategy": split_strategy,
+        "interleaved_block_rows": interleaved_block_rows,
+        "train_fraction": train_fraction,
+        "validation_fraction": validation_fraction,
         "train_full_rows": len(train_full_df),
         "validation_rows": len(valid_df),
         "test_rows": len(test_df),
         "train_subset_strategy": train_subset_strategy,
         "train_subset_max_rows": train_subset_max_rows,
+        "issue_rows_per_file": issue_rows_per_file,
+        "balanced_reviewed_target_issue_share": balanced_reviewed_target_issue_share,
         "train_subset_rows": len(train_df),
     }
     if verbose:
@@ -465,11 +583,15 @@ def load_ml_section_state(
             "LOCAL_CACHE_DIR": repo_root / "data" / "cache" / "session1",
             "SHARED_CACHE_DIR": shared_cache_dir,
             "DATASET_PROFILES": DATASET_PROFILES,
+            "DATASET_CONFIG": dataset_config,
             "DATASET_PROFILE_ID": dataset_profile_id,
             "DATASET_PROFILE": profile,
             "DATASET_LABEL": profile["label"],
             "READ_RAW_DATA_DIR": str(raw_dir),
             "READ_CACHE_DIR": str(cache_dir),
+            "RAW_CSV_PATHS": [str(path) for path in (raw_csv_paths or [])],
+            "TIME_COLUMN": time_column,
+            "CSV_HEADER": csv_header,
             "RAW_DATA_DIR": str(active_raw_data_dir),
             "CACHE_DIR": str(active_cache_paths.root),
             "ROW_CACHE_DIR": str(row_cache_dir),
@@ -489,8 +611,8 @@ def load_ml_section_state(
             "OPTIONAL_QC_COLUMNS": optional_qc_columns,
             "PLOT_MEASUREMENT_COLUMN": plot_measurement_column,
             "PLOT_SECONDARY_COLUMN": plot_secondary_column,
-            "PRIMARY_DEVICE": profile["primary_device"],
-            "KMEANS_FEATURE_MODE": profile["kmeans_feature_mode"],
+            "PRIMARY_DEVICE": primary_device,
+            "KMEANS_FEATURE_MODE": kmeans_feature_mode,
             "DEFAULT_SEQUENCE_OUTPUT_MODE": profile.get("default_sequence_output_mode", "window"),
             "DEFAULT_SEQUENCE_TARGET_STRATEGY": profile.get("default_sequence_target_strategy", "collapsed_1_34_9"),
             "DATA_FRACTION": data_fraction,
@@ -502,14 +624,6 @@ def load_ml_section_state(
             "TRAIN_SUBSET_MIN_ROWS": train_subset_min_rows,
             "ISSUE_ROWS_PER_FILE_BASE": issue_rows_per_file_base,
             "ISSUE_ROWS_PER_FILE_MIN": issue_rows_per_file_min,
-            "RF_TRAIN_BASE_ROWS": rf_train_base_rows,
-            "RF_TRAIN_MIN_ROWS": rf_train_min_rows,
-            "RF_EVAL_BASE_ROWS": rf_eval_base_rows,
-            "RF_EVAL_MIN_ROWS": rf_eval_min_rows,
-            "KMEANS_WINDOW_BASE_ROWS": kmeans_window_base_rows,
-            "KMEANS_WINDOW_MIN_ROWS": kmeans_window_min_rows,
-            "SEARCH_MODEL_BASE_ROWS": search_model_base_rows,
-            "SEARCH_MODEL_MIN_ROWS": search_model_min_rows,
             "BASE_ISSUE_ROWS_PER_FILE": 12_000,
             "BASE_MODEL_ROW_LIMIT": 1_000_000,
             "BASE_WINDOW_POINT_LIMIT": 1.0,
@@ -540,6 +654,8 @@ def load_ml_section_state(
             "active_labels": active_labels,
             "model_good_labels": model_good_labels,
             "model_issue_labels": model_issue_labels,
+            "REVIEWED_FILE_SELECTION_MODE": reviewed_file_selection_mode,
+            "REVIEWED_FILE_LIMIT": reviewed_file_limit,
             "SPLIT_STRATEGY": split_strategy,
             "FIXED_SPLIT_STRATEGY": split_strategy,
             "REVIEWED_MODEL_ROW_LIMIT": reviewed_model_row_limit,
@@ -555,14 +671,8 @@ def load_ml_section_state(
             "TRAIN_SUBSET_STRATEGY": train_subset_strategy,
             "TRAIN_SUBSET_MAX_ROWS": train_subset_max_rows,
             "ISSUE_ROWS_PER_FILE": issue_rows_per_file,
-            "RF_TRAIN_MAX_ROWS": rf_train_max_rows,
-            "RF_VALIDATION_MAX_ROWS": rf_validation_max_rows,
-            "RF_TEST_MAX_ROWS": rf_test_max_rows,
             "BALANCED_REVIEWED_TARGET_ISSUE_SHARE": balanced_reviewed_target_issue_share,
             "train_df": train_df,
-            "KMEANS_WINDOW_LIMIT": kmeans_window_limit,
-            "RF_SEARCH_MODEL_ROW_LIMIT": rf_search_model_row_limit,
-            "CNN_SEARCH_MODEL_ROW_LIMIT": cnn_search_model_row_limit,
             "CNN_RUN": False,
             "SEQUENCE_CNN_RUN": False,
             "TRANSFORMER_RUN": False,

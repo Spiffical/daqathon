@@ -16,8 +16,11 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import PercentFormatter
 from sklearn.metrics import ConfusionMatrixDisplay
 
-from . import prepare_scalar_session1_data
 from .prepare_scalar_session1_data import locate_header, read_scalar_csv
+from .parquet_cache_utils import (
+    resolve_csv_paths,
+    resolve_or_create_parquet_cache as _resolve_or_create_parquet_cache,
+)
 from .session1_modeling import (
     DEFAULT_FLAG_PALETTE,
     build_labeled_intervals,
@@ -40,6 +43,8 @@ from .session1_modeling import (
     resolve_cache_bundle_paths,
     select_time_range,
     split_frame_by_strategy,
+    stage_cache_into_runtime,
+    stage_directory_into_runtime,
     summarize_split_distributions,
     summarize_target_by_time_bin,
 )
@@ -65,6 +70,113 @@ def choose_cache_bundle_paths(
     if fallback_root is None:
         raise ValueError("At least one cache root is required")
     return build_cache_bundle_paths(fallback_root, cache_stem=cache_stem)
+
+
+def _csv_paths_from_inputs(
+    *,
+    raw_data_dir: str | Path | None = None,
+    raw_csv_paths: Iterable[str | Path] | None = None,
+) -> list[Path]:
+    """Backward-compatible wrapper around ``resolve_csv_paths``."""
+
+    return resolve_csv_paths(raw_data_dir=raw_data_dir, raw_csv_paths=raw_csv_paths)
+
+
+def stage_session1_inputs(
+    *,
+    read_raw_data_dir: str | Path,
+    runtime_raw_data_dir: str | Path,
+    read_cache_dir: str | Path,
+    runtime_cache_dir: str | Path,
+    cache_bundle_name: str,
+    dataset_label: str,
+    use_runtime_raw_data_for_reads: bool,
+    use_runtime_cache_for_reads: bool,
+    raw_csv_paths: Iterable[str | Path] | None = None,
+    force: bool = False,
+) -> dict[str, object]:
+    """Stage raw CSV files and the parquet cache into fast runtime storage.
+
+    On Alliance clusters this usually means copying shared project files into
+    ``SLURM_TMPDIR``. Locally, the function simply points the notebook back at
+    the original source directories.
+    """
+
+    read_raw_path = Path(read_raw_data_dir).expanduser()
+    runtime_raw_path = Path(runtime_raw_data_dir).expanduser()
+    read_cache_path = Path(read_cache_dir).expanduser()
+    runtime_cache_path = Path(runtime_cache_dir).expanduser()
+    explicit_csv_paths = _csv_paths_from_inputs(raw_csv_paths=raw_csv_paths)
+
+    raw_stage_result: dict[str, object] = {
+        "staged": False,
+        "reason": "raw-data staging is disabled because runtime raw-data reads are not enabled",
+    }
+    cache_stage_result: dict[str, object] = {
+        "staged": False,
+        "reason": "cache staging is disabled because runtime cache reads are not enabled",
+    }
+
+    staged_csv_paths: list[Path] = []
+    if use_runtime_raw_data_for_reads:
+        if explicit_csv_paths:
+            runtime_raw_path.mkdir(parents=True, exist_ok=True)
+            for csv_path in explicit_csv_paths:
+                destination = runtime_raw_path / csv_path.name
+                if force or not destination.exists():
+                    shutil.copy2(csv_path, destination)
+                staged_csv_paths.append(destination)
+            raw_stage_result = {
+                "staged": True,
+                "mode": "explicit_csv_files",
+                "source_files": len(explicit_csv_paths),
+                "runtime_dir": str(runtime_raw_path),
+            }
+        else:
+            raw_stage_result = stage_directory_into_runtime(
+                source_dir=read_raw_path,
+                runtime_dir=runtime_raw_path,
+                force=force,
+                show_progress=True,
+                progress_label=f"Staging raw CSV files for {dataset_label} to runtime storage",
+            )
+
+    if use_runtime_cache_for_reads:
+        cache_stage_result = stage_cache_into_runtime(
+            persistent_cache_dir=read_cache_path,
+            runtime_cache_dir=runtime_cache_path,
+            force=force,
+            show_progress=True,
+            progress_label="Staging parquet cache to runtime storage",
+        )
+
+    active_raw_data_dir = (
+        runtime_raw_path
+        if runtime_raw_path.exists() and any(runtime_raw_path.glob("*.csv"))
+        else read_raw_path
+    )
+    active_raw_csv_paths = [str(path) for path in staged_csv_paths] if staged_csv_paths else [str(path) for path in explicit_csv_paths]
+    cache_candidates = [runtime_cache_path, read_cache_path] if use_runtime_cache_for_reads else [read_cache_path]
+    active_cache_paths = choose_cache_bundle_paths(cache_candidates, cache_stem=cache_bundle_name)
+    notebook_values = {
+        "RAW_DATA_DIR": str(active_raw_data_dir),
+        "RAW_CSV_PATHS": active_raw_csv_paths,
+        "CACHE_DIR": str(active_cache_paths.root),
+        "ROW_CACHE_DIR": str(active_cache_paths.row_level_dir),
+        "WINDOW_CACHE_PATH": str(active_cache_paths.window_cache_path),
+        "METADATA_PATH": str(active_cache_paths.metadata_path),
+        "active_cache_paths": active_cache_paths,
+    }
+    summary = {
+        "raw_stage_result": raw_stage_result,
+        "cache_stage_result": cache_stage_result,
+        "active_raw_data_dir": str(active_raw_data_dir),
+        "active_csv_files": len(active_raw_csv_paths) if active_raw_csv_paths else None,
+        "active_cache_dir": str(active_cache_paths.root),
+        "cache_bundle_name": cache_bundle_name,
+        "resolved_cache_stem": active_cache_paths.stem,
+    }
+    return {"notebook_values": notebook_values, "summary": summary}
 
 
 def read_parquet_head(
@@ -98,312 +210,55 @@ def read_parquet_head(
     return pd.concat(frames, ignore_index=True)
 
 
-def create_session1_row_level_parquet_cache(
+def resolve_or_create_parquet_cache(
     *,
-    raw_data_dir: str | Path,
     cache_root: str | Path,
     cache_bundle_name: str,
     target_flag: str,
-    primary_device: str,
     measurement_columns: list[str] | tuple[str, ...],
+    issue_labels: list[int] | tuple[int, ...],
+    raw_data_dir: str | Path | None = None,
+    raw_csv_paths: Iterable[str | Path] | None = None,
+    optional_qc_columns: list[str] | tuple[str, ...] | None = None,
+    time_column: str = "Time UTC",
+    csv_header: str | int = "auto",
+    build_cache_if_missing: bool = False,
+    force_rebuild_cache: bool = False,
+    generic_csv_cache: bool = False,
+    primary_device: str = "ctd",
     max_files: int | None = None,
     sample_rows: int | None = None,
+    window_size: int = 256,
     merge_tolerance_seconds: int = 5,
 ) -> dict[str, object]:
-    """Create the row-level Session 1 parquet cache from raw CSV files.
+    """Return an existing parquet cache or build one from CSV files if requested.
 
-    This function writes one row-level parquet part per selected primary CSV.
-    If the dataset has companion CTD/oxygen/fluorometer files, they are aligned
-    onto the primary timestamps before the parquet parts are written.
+    ``generic_csv_cache=True`` is the flexible path for participant-owned CSVs:
+    it writes row-level parquet parts directly from one or more CSV files. The
+    richer ONC prep path can still be used when companion device streams and
+    window-summary parquet need to be created.
     """
 
-    cache_paths = prepare_scalar_session1_data.build_cache_bundle_paths(
-        Path(cache_root),
-        cache_bundle_name,
-    )
-    prepare_scalar_session1_data.clear_old_outputs(cache_paths)
-    row_result = prepare_scalar_session1_data.write_row_level_parquet_cache(
-        data_root=Path(raw_data_dir),
-        bundle_paths=cache_paths,
+    return _resolve_or_create_parquet_cache(
+        cache_root=cache_root,
+        cache_bundle_name=cache_bundle_name,
         target_flag=target_flag,
+        measurement_columns=measurement_columns,
+        issue_labels=issue_labels,
+        raw_data_dir=raw_data_dir,
+        raw_csv_paths=raw_csv_paths,
+        optional_qc_columns=optional_qc_columns,
+        time_column=time_column,
+        csv_header=csv_header,
+        build_cache_if_missing=build_cache_if_missing,
+        force_rebuild_cache=force_rebuild_cache,
+        generic_csv_cache=generic_csv_cache,
         primary_device=primary_device,
         max_files=max_files,
         sample_rows=sample_rows,
-        requested_measurement_columns=list(measurement_columns),
-        merge_tolerance_seconds=merge_tolerance_seconds,
-        clear_existing=False,
-    )
-    return {
-        "row_result": row_result,
-        "cache_paths": cache_paths,
-        "summary": {
-            "step": "row_level_parquet",
-            "row_level_cache": str(cache_paths.row_level_dir),
-            "row_parts": len(row_result.processed_files),
-            "rows": int(row_result.total_rows),
-            "measurement_columns": row_result.measurement_columns,
-            "missing_measurement_columns": row_result.missing_measurement_columns,
-        },
-    }
-
-
-def create_session1_window_level_parquet_cache(
-    row_cache_result: dict[str, object],
-    *,
-    target_flag: str,
-    issue_labels: list[int] | tuple[int, ...],
-    window_size: int = 256,
-    sample_rows: int | None = None,
-    merge_tolerance_seconds: int = 5,
-    primary_device: str,
-    max_files: int | None = None,
-) -> dict[str, object]:
-    """Create the Session 1 window-summary parquet from row-level parquet parts."""
-
-    row_result = row_cache_result["row_result"]
-    cache_paths = row_cache_result["cache_paths"]
-    issue_label_list = sorted(dict.fromkeys(int(label) for label in issue_labels))
-    window_result = prepare_scalar_session1_data.write_window_level_parquet_cache(
-        bundle_paths=cache_paths,
-        processed_files=row_result.processed_files,
-        target_flag=target_flag,
         window_size=window_size,
-        measurement_columns=row_result.measurement_columns,
-        issue_labels=issue_label_list,
-    )
-    metadata = prepare_scalar_session1_data.write_cache_metadata(
-        bundle_paths=cache_paths,
-        row_result=row_result,
-        window_result=window_result,
-        target_flag=target_flag,
-        sample_rows=sample_rows,
-        window_size=window_size,
-        issue_labels=issue_label_list,
         merge_tolerance_seconds=merge_tolerance_seconds,
-        primary_device=primary_device,
-        file_selection_strategy="primary_time_aligned_selection" if max_files is not None else "all_files",
     )
-    return {
-        "window_result": window_result,
-        "metadata": metadata,
-        "cache_paths": cache_paths,
-        "summary": {
-            "step": "window_level_parquet",
-            "window_cache": str(cache_paths.window_cache_path),
-            "metadata": str(cache_paths.metadata_path),
-            "windows": int(window_result.window_count),
-            "window_columns": window_result.window_columns,
-        },
-    }
-
-
-def csv_files_to_parquet_cache(
-    csv_paths: Iterable[str | Path],
-    output_dir: str | Path,
-    *,
-    cache_name: str = "scalar_session1",
-    columns: list[str] | None = None,
-    required_columns: list[str] | tuple[str, ...] | None = None,
-    time_column: str = "Time UTC",
-    source_file_column: str = "source_file",
-    sample_rows_per_file: int | None = None,
-    header: str | int = "auto",
-    force: bool = False,
-    compression: str = "zstd",
-) -> dict[str, object]:
-    """Convert one or more scalar CSV files into a row-level parquet cache.
-
-    Parameters
-    ----------
-    csv_paths:
-        CSV files to convert. Each file becomes one parquet part.
-    output_dir:
-        Directory where the cache folder and metadata file will be written.
-    cache_name:
-        Cache stem used for the row-level folder and metadata filename.
-    columns:
-        Optional ordered subset of columns to read and keep. The time column is
-        always included, and the source-file column is added after reading.
-    required_columns:
-        Columns that must be present in every CSV. If omitted, ``columns`` are
-        treated as the required input columns.
-    time_column:
-        Timestamp column to parse, sort by, and preserve in the parquet output.
-    source_file_column:
-        Name of the output column that records which CSV each row came from.
-    sample_rows_per_file:
-        Optional row cap per CSV, useful for quick test runs.
-    header:
-        ``"auto"`` uses the ONC metadata/header detector, ``"first_row"`` uses
-        the first CSV row as the header, and an integer uses that zero-based row
-        number as the header while skipping rows above it.
-    force:
-        If ``True``, replace an existing cache with the same name.
-    compression:
-        Parquet compression codec passed to pandas.
-
-    Returns
-    -------
-    dict
-        Metadata describing the generated cache.
-    """
-
-    csv_path_list = sorted(Path(path).expanduser() for path in csv_paths)
-    if not csv_path_list:
-        raise ValueError("csv_paths must contain at least one CSV file.")
-
-    bundle_paths = build_cache_bundle_paths(output_dir, cache_name)
-    if (bundle_paths.row_level_dir.exists() or bundle_paths.metadata_path.exists()) and not force:
-        raise FileExistsError(
-            f"Cache '{cache_name}' already exists under {bundle_paths.root}. "
-            "Pass force=True to rebuild it."
-        )
-
-    if force:
-        shutil.rmtree(bundle_paths.row_level_dir, ignore_errors=True)
-        bundle_paths.metadata_path.unlink(missing_ok=True)
-    bundle_paths.root.mkdir(parents=True, exist_ok=True)
-    bundle_paths.row_level_dir.mkdir(parents=True, exist_ok=True)
-
-    requested_columns = [
-        column
-        for column in dict.fromkeys(columns or [])
-        if column != source_file_column
-    ]
-    required_input_columns = [
-        column
-        for column in dict.fromkeys(required_columns or requested_columns)
-        if column != source_file_column
-    ]
-    if time_column not in required_input_columns:
-        required_input_columns.insert(0, time_column)
-    if time_column not in requested_columns:
-        requested_columns.insert(0, time_column)
-    read_columns = (
-        list(dict.fromkeys([*requested_columns, *required_input_columns]))
-        if columns is not None
-        else None
-    )
-
-    processed_files: list[dict[str, object]] = []
-    total_rows = 0
-    all_output_columns: list[str] = []
-
-    for index, csv_path in enumerate(csv_path_list, start=1):
-        frame = _read_csv_for_parquet_cache(
-            csv_path,
-            header=header,
-            columns=read_columns,
-            required_columns=required_input_columns,
-            sample_rows_per_file=sample_rows_per_file,
-            time_column=time_column,
-        )
-        frame = frame.copy()
-        if source_file_column != "source_file" and "source_file" in frame.columns:
-            frame = frame.drop(columns=["source_file"])
-        frame[time_column] = pd.to_datetime(frame[time_column], utc=True, errors="coerce", format="ISO8601")
-        for column in [column for column in frame.columns if column != time_column]:
-            if column != source_file_column:
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        frame = frame.dropna(subset=[time_column]).sort_values(time_column).reset_index(drop=True)
-        frame[source_file_column] = csv_path.name
-
-        if columns is not None:
-            output_columns = [column for column in requested_columns if column in frame.columns]
-            if source_file_column not in output_columns:
-                output_columns.append(source_file_column)
-            frame = frame[output_columns]
-
-        for column in frame.columns:
-            if column not in all_output_columns:
-                all_output_columns.append(column)
-
-        part_path = bundle_paths.row_level_dir / f"part-{index:03d}.parquet"
-        frame.to_parquet(part_path, index=False, compression=compression)
-
-        row_count = int(len(frame))
-        total_rows += row_count
-        processed_files.append(
-            {
-                "source_file": csv_path.name,
-                "source_path": str(csv_path),
-                "row_count": row_count,
-                "time_start": frame[time_column].min().isoformat() if row_count else None,
-                "time_end": frame[time_column].max().isoformat() if row_count else None,
-                "row_level_part": part_path.name,
-            }
-        )
-
-    # Keep the cache metadata movable between laptops, clusters, and scratch
-    # directories. The caller already knows which cache directory is active.
-    metadata: dict[str, object] = {
-        "cache_root": ".",
-        "cache_path_base": "metadata_directory",
-        "cache_stem": bundle_paths.stem,
-        "row_level_cache": bundle_paths.row_level_dir.name,
-        "metadata_path": bundle_paths.metadata_path.name,
-        "processed_file_count": len(processed_files),
-        "row_count": int(total_rows),
-        "sample_rows_per_file": sample_rows_per_file,
-        "header": header,
-        "time_column": time_column,
-        "source_file_column": source_file_column,
-        "row_columns": all_output_columns,
-        "processed_files": processed_files,
-        "part_to_source_file": {
-            str(file_info["row_level_part"]): str(file_info["source_file"])
-            for file_info in processed_files
-        },
-    }
-    bundle_paths.metadata_path.write_text(json.dumps(metadata, indent=2))
-    return metadata
-
-
-def _read_csv_for_parquet_cache(
-    csv_path: Path,
-    *,
-    header: str | int,
-    columns: list[str] | None,
-    required_columns: list[str],
-    sample_rows_per_file: int | None,
-    time_column: str,
-) -> pd.DataFrame:
-    """Read one CSV using the requested header style before parquet export."""
-
-    if header == "auto":
-        frame = read_scalar_csv(
-            csv_path,
-            sample_rows=sample_rows_per_file,
-            required_columns=columns,
-            allow_missing_columns=False,
-        )
-        missing_columns = [column for column in required_columns if column not in frame.columns]
-        if missing_columns:
-            raise ValueError(f"Missing expected columns in {csv_path}: {missing_columns}")
-        return frame
-
-    if header == "first_row":
-        header_row = 0
-    elif isinstance(header, int):
-        header_row = int(header)
-    else:
-        raise ValueError('header must be "auto", "first_row", or an integer row number.')
-    if header_row < 0:
-        raise ValueError("header row number must be zero or greater.")
-
-    frame = pd.read_csv(
-        csv_path,
-        header=header_row,
-        usecols=columns,
-        nrows=sample_rows_per_file,
-        low_memory=False,
-    )
-    missing_columns = [column for column in required_columns if column not in frame.columns]
-    if missing_columns:
-        raise ValueError(f"Missing expected columns in {csv_path}: {missing_columns}")
-    if time_column not in frame.columns:
-        raise ValueError(f"Missing {time_column} in {csv_path}")
-    return frame
 
 
 def evenly_spaced_take(
@@ -818,6 +673,83 @@ def show_session1_cache_inspection(**kwargs) -> dict[str, object]:
         cache_context["column_summary_table"],
     )
     return cache_context
+
+
+def load_session1_cache_context(
+    *,
+    cache_roots: list[str | Path | None],
+    cache_bundle_name: str,
+) -> dict[str, object]:
+    """Load cache metadata and common notebook variables from a parquet bundle."""
+
+    active_cache_paths = choose_cache_bundle_paths(cache_roots, cache_stem=cache_bundle_name)
+    row_cache_dir = active_cache_paths.row_level_dir
+    window_cache_path = active_cache_paths.window_cache_path
+    metadata_path = active_cache_paths.metadata_path
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing cache metadata at {metadata_path}.")
+
+    metadata = json.loads(metadata_path.read_text())
+    part_paths = sorted(row_cache_dir.glob("*.parquet"))
+    if not part_paths:
+        raise FileNotFoundError(f"No parquet parts found in {row_cache_dir}.")
+
+    processed_files = metadata.get("processed_files", [])
+    part_to_source = {
+        Path(str(file_info["row_level_part"])).name: str(file_info["source_file"])
+        for file_info in processed_files
+        if "row_level_part" in file_info and "source_file" in file_info
+    }
+    source_to_row_part = {
+        str(file_info["source_file"]): row_cache_dir / Path(str(file_info["row_level_part"])).name
+        for file_info in processed_files
+        if "row_level_part" in file_info and "source_file" in file_info
+    }
+    processed_file_summary = pd.DataFrame(processed_files)
+    if not processed_file_summary.empty:
+        keep_columns = [
+            column
+            for column in ["source_file", "row_count", "time_start", "time_end"]
+            if column in processed_file_summary.columns
+        ]
+        processed_file_summary = processed_file_summary[keep_columns].copy()
+        if "source_file" in processed_file_summary.columns:
+            processed_file_summary["source_file"] = processed_file_summary["source_file"].astype(str).str.replace(
+                r"_\d{8}T\d{6}Z_\d{8}T\d{6}Z-NaN\.csv$",
+                "",
+                regex=True,
+            )
+
+    cache_summary = {
+        "active_cache_dir": str(active_cache_paths.root),
+        "cache_bundle_name": cache_bundle_name,
+        "row_cache_parts": len(part_paths),
+        "full_row_count": int(metadata.get("row_count", 0)),
+        "full_window_count": int(metadata.get("window_count", 0) or 0),
+        "processed_file_count": int(metadata.get("processed_file_count", len(processed_files))),
+        "issue_fraction": round(float(metadata.get("issue_fraction", 0.0) or 0.0), 4),
+        "window_cache_path": str(window_cache_path),
+        "metadata_path": str(metadata_path),
+    }
+    notebook_values = {
+        "active_cache_paths": active_cache_paths,
+        "CACHE_DIR": str(active_cache_paths.root),
+        "ROW_CACHE_DIR": str(row_cache_dir),
+        "WINDOW_CACHE_PATH": str(window_cache_path),
+        "METADATA_PATH": str(metadata_path),
+        "row_cache_dir": row_cache_dir,
+        "window_cache_path": window_cache_path,
+        "metadata_path": metadata_path,
+        "metadata": metadata,
+        "part_paths": part_paths,
+        "part_to_source": part_to_source,
+        "source_to_row_part": source_to_row_part,
+    }
+    return {
+        "notebook_values": notebook_values,
+        "cache_summary": cache_summary,
+        "processed_file_summary": processed_file_summary,
+    }
 
 
 def plot_session1_cache_inspection(

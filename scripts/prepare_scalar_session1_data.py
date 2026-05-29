@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build a typed parquet cache from ONC scalar CSV exports.
 
-This script is the "raw data to ML-ready cache" bridge used by the Session 1
-notebooks. Its job is to take one folder of ONC CSV exports, clean and type the
+This is the original implementation behind the reusable ONC scalar cache
+pipeline. Its job is to take one folder of ONC CSV exports, clean and type the
 raw values, optionally merge secondary device streams onto one primary time
 base, and then write two reusable parquet artifacts:
 
@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,14 +29,15 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from .session1_defaults import (
+    from workshop_config.session1_defaults import (
         CTD_MEASUREMENT_COLUMNS,
         DEFAULT_CACHE_STEM,
         DEFAULT_ISSUE_LABELS,
         PREFERRED_SCALAR_MEASUREMENT_COLUMNS,
     )
 except ImportError:  # pragma: no cover - supports direct CLI execution
-    from session1_defaults import (  # type: ignore
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from workshop_config.session1_defaults import (
         CTD_MEASUREMENT_COLUMNS,
         DEFAULT_CACHE_STEM,
         DEFAULT_ISSUE_LABELS,
@@ -172,7 +174,7 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(
-        description="Prepare ONC scalar CSV files for the DAQathon Session 1 notebooks."
+        description="Prepare ONC scalar CSV files as reusable row-level and window-summary parquet caches."
     )
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)

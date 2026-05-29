@@ -26,7 +26,7 @@ from scripts.session1_modeling import (
     load_full_row_level_frame,
     split_frame_by_strategy,
 )
-from scripts.session1_profiles import DATASET_PROFILES as SESSION1_DATASET_PROFILES
+from workshop_config.session1_dataset_profiles import DATASET_PROFILES as SESSION1_DATASET_PROFILES
 
 
 FORECAST_DATASET_PROFILES = {

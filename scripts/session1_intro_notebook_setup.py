@@ -27,6 +27,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 
 from . import prepare_scalar_session1_data as _prepare_scalar_session1_data
+from . import onc_scalar_cache_utils as _onc_scalar_cache_utils
+from . import parquet_cache_utils as _parquet_cache_utils
 from . import session1_intro_utils as _session1_intro_utils
 from . import session1_modeling as _session1_modeling
 
@@ -83,9 +85,6 @@ MODELING_EXPORTS = [
 
 INTRO_UTIL_EXPORTS = [
     "choose_cache_bundle_paths",
-    "create_session1_row_level_parquet_cache",
-    "create_session1_window_level_parquet_cache",
-    "csv_files_to_parquet_cache",
     "directory_size_bytes",
     "derive_fractional_row_limit",
     "filter_csv_paths_with_required_columns",
@@ -100,13 +99,26 @@ INTRO_UTIL_EXPORTS = [
     "summarize_issue_adequacy",
     "build_split_strategy_tables",
     "show_session1_cache_inspection",
+    "load_session1_cache_context",
     "read_parquet_head",
     "select_part_paths",
+    "stage_session1_inputs",
     "show_reviewed_split_summary",
     "show_session1_cache_read_comparison",
     "show_split_strategy_comparison",
     "show_split_strategy_timeline",
     "show_temporal_flag_summary",
+]
+
+CACHE_UTIL_EXPORTS = [
+    "csv_files_to_row_parquet_cache",
+    "resolve_csv_paths",
+    "resolve_or_create_parquet_cache",
+]
+
+ONC_CACHE_UTIL_EXPORTS = [
+    "create_onc_row_level_parquet_cache",
+    "create_onc_window_summary_parquet_cache",
 ]
 
 PREP_EXPORTS = [
@@ -153,16 +165,118 @@ def _select_exports(module, names: list[str]) -> dict[str, object]:
     return {name: getattr(module, name) for name in names}
 
 
-def build_intro_notebook_namespace(
+def _resolve_project_base(base_dir: str | Path | None) -> Path:
+    start = Path.cwd() if base_dir is None else Path(base_dir).expanduser()
+    for candidate in [start, *start.parents]:
+        if (candidate / "scripts").exists() and (candidate / "notebooks").exists():
+            return candidate
+    return start
+
+
+def build_intro_runtime_state(
     *,
-    notebook_root: str | Path,
+    base_dir: str | Path | None = None,
+    notebook_root: str | Path | None = None,
     read_raw_data_dir: str | Path,
     read_cache_dir: str | Path,
     cache_bundle_name: str,
     seed: int,
 ) -> dict[str, object]:
+    """Return runtime paths and output locations for the Session 1 notebooks.
+
+    This helper keeps environment-specific path logic out of the notebooks. It
+    intentionally does not export imports or helper functions; the notebooks
+    import those normally so their origins stay visible.
+    """
+
+    if base_dir is not None and notebook_root is not None:
+        raise ValueError("Use only one of base_dir or notebook_root.")
+    project_base = _resolve_project_base(base_dir if base_dir is not None else notebook_root)
+
+    importlib.invalidate_caches()
+    session1_modeling = importlib.reload(_session1_modeling)
+
+    slurm_tmpdir = os.environ.get("SLURM_TMPDIR")
+    scratch = os.environ.get("SCRATCH")
+
+    runtime_output_root = session1_modeling.resolve_runtime_output_root(
+        project_base,
+        slurm_tmpdir=slurm_tmpdir,
+        scratch_dir=scratch,
+    )
+    runtime_raw_data_dir = runtime_output_root / "data" / "raw" / Path(read_raw_data_dir).name
+    runtime_cache_dir = runtime_output_root / "cache" / "session1"
+    artifact_dir = runtime_output_root / "artifacts"
+    model_output_dir = runtime_output_root / "models"
+    plot_output_dir = runtime_output_root / "plots"
+    report_output_dir = runtime_output_root / "reports"
+
+    for output_dir in [runtime_output_root, artifact_dir, model_output_dir, plot_output_dir, report_output_dir]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    use_runtime_raw_data_for_reads = bool(slurm_tmpdir)
+    use_runtime_cache_for_reads = bool(slurm_tmpdir)
+    raw_data_dir = str(runtime_raw_data_dir if use_runtime_raw_data_for_reads else Path(read_raw_data_dir))
+    cache_dir = str(runtime_cache_dir if use_runtime_cache_for_reads else Path(read_cache_dir))
+    cache_paths = session1_modeling.build_cache_bundle_paths(cache_dir, cache_bundle_name)
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    pd.set_option("display.max_columns", 100)
+    np.random.seed(seed)
+
+    summary = {
+        "READ_RAW_DATA_DIR": str(read_raw_data_dir),
+        "READ_CACHE_DIR": str(read_cache_dir),
+        "USE_RUNTIME_RAW_DATA_FOR_READS": use_runtime_raw_data_for_reads,
+        "USE_RUNTIME_CACHE_FOR_READS": use_runtime_cache_for_reads,
+        "RUNTIME_OUTPUT_ROOT": str(runtime_output_root),
+        "RUNTIME_RAW_DATA_DIR": str(runtime_raw_data_dir),
+        "CACHE_BUNDLE_NAME": cache_bundle_name,
+        "ROW_CACHE_DIR": str(cache_paths.row_level_dir),
+        "WINDOW_CACHE_PATH": str(cache_paths.window_cache_path),
+    }
+
+    return {
+        "SLURM_TMPDIR": slurm_tmpdir,
+        "SCRATCH": scratch,
+        "RUNTIME_OUTPUT_ROOT": runtime_output_root,
+        "RUNTIME_RAW_DATA_DIR": runtime_raw_data_dir,
+        "RUNTIME_CACHE_DIR": runtime_cache_dir,
+        "ARTIFACT_DIR": artifact_dir,
+        "MODEL_OUTPUT_DIR": model_output_dir,
+        "PLOT_OUTPUT_DIR": plot_output_dir,
+        "REPORT_OUTPUT_DIR": report_output_dir,
+        "USE_RUNTIME_RAW_DATA_FOR_READS": use_runtime_raw_data_for_reads,
+        "USE_RUNTIME_CACHE_FOR_READS": use_runtime_cache_for_reads,
+        "RAW_DATA_DIR": raw_data_dir,
+        "CACHE_DIR": cache_dir,
+        "ROW_CACHE_DIR": str(cache_paths.row_level_dir),
+        "WINDOW_CACHE_PATH": str(cache_paths.window_cache_path),
+        "METADATA_PATH": str(cache_paths.metadata_path),
+        "RF_MODEL_PATH": model_output_dir / "best_random_forest.pkl",
+        "CNN_MODEL_PATH": model_output_dir / "best_cnn_checkpoint.pt",
+        "TRANSFORMER_MODEL_PATH": model_output_dir / "best_transformer_checkpoint.pt",
+        "INTRO_NOTEBOOK_SETUP_SUMMARY": summary,
+    }
+
+
+def build_intro_notebook_namespace(
+    *,
+    base_dir: str | Path | None = None,
+    notebook_root: str | Path | None = None,
+    read_raw_data_dir: str | Path,
+    read_cache_dir: str | Path,
+    cache_bundle_name: str,
+    seed: int,
+) -> dict[str, object]:
+    if base_dir is not None and notebook_root is not None:
+        raise ValueError("Use only one of base_dir or notebook_root.")
+    project_base = _resolve_project_base(base_dir if base_dir is not None else notebook_root)
+
     importlib.invalidate_caches()
     prepare_scalar_session1_data = importlib.reload(_prepare_scalar_session1_data)
+    onc_scalar_cache_utils = importlib.reload(_onc_scalar_cache_utils)
+    parquet_cache_utils = importlib.reload(_parquet_cache_utils)
     session1_intro_utils = importlib.reload(_session1_intro_utils)
     session1_modeling = importlib.reload(_session1_modeling)
 
@@ -170,7 +284,7 @@ def build_intro_notebook_namespace(
     scratch = os.environ.get("SCRATCH")
 
     runtime_output_root = session1_modeling.resolve_runtime_output_root(
-        notebook_root,
+        project_base,
         slurm_tmpdir=slurm_tmpdir,
         scratch_dir=scratch,
     )
@@ -228,6 +342,8 @@ def build_intro_notebook_namespace(
         "plt": plt,
         "pq": pq,
         "prepare_scalar_session1_data": prepare_scalar_session1_data,
+        "onc_scalar_cache_utils": onc_scalar_cache_utils,
+        "parquet_cache_utils": parquet_cache_utils,
         "print": notebook_print,
         "RandomForestClassifier": RandomForestClassifier,
         "ConfusionMatrixDisplay": ConfusionMatrixDisplay,
@@ -262,5 +378,7 @@ def build_intro_notebook_namespace(
     }
     namespace.update(_select_exports(session1_modeling, MODELING_EXPORTS))
     namespace.update(_select_exports(session1_intro_utils, INTRO_UTIL_EXPORTS))
+    namespace.update(_select_exports(parquet_cache_utils, CACHE_UTIL_EXPORTS))
+    namespace.update(_select_exports(onc_scalar_cache_utils, ONC_CACHE_UTIL_EXPORTS))
     namespace.update(_select_exports(prepare_scalar_session1_data, PREP_EXPORTS))
     return namespace
