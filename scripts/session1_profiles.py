@@ -271,6 +271,7 @@ def build_dataset_profile_namespace(
         "DEFAULT_SEQUENCE_TARGET_STRATEGY": str(
             manual_sequence_target_strategy or profile.get("default_sequence_target_strategy", "collapsed_1_34_9")
         ),
+        "SEQUENCE_INDICATOR_CHANNELS": [dict(spec) for spec in profile.get("sequence_indicator_channels", [])],
         "RAW_CACHE_READ_SAMPLE_ROWS": profile.get("cache_read_sample_rows"),
         "AUTO_BUILD_MISSING_CACHE": (
             bool(manual_auto_build_missing_cache)
@@ -443,6 +444,7 @@ def dataset_profile_summary(config: dict[str, object]) -> dict[str, object]:
         "KMEANS_FEATURE_MODE": config["KMEANS_FEATURE_MODE"],
         "DEFAULT_SEQUENCE_OUTPUT_MODE": config["DEFAULT_SEQUENCE_OUTPUT_MODE"],
         "DEFAULT_SEQUENCE_TARGET_STRATEGY": config["DEFAULT_SEQUENCE_TARGET_STRATEGY"],
+        "SEQUENCE_INDICATOR_CHANNELS": config["SEQUENCE_INDICATOR_CHANNELS"],
         "GOOD_LABELS": config["GOOD_LABELS"],
         "ISSUE_LABELS": config["ISSUE_LABELS"],
         "MEASUREMENT_COLUMNS": config["MEASUREMENT_COLUMNS"],
@@ -470,4 +472,5 @@ def dataset_profile_summary_rows(config: dict[str, object]) -> list[dict[str, ob
         {"group": "plots", "name": "PLOT_SECONDARY_COLUMN", "value": config["PLOT_SECONDARY_COLUMN"], "what_it_controls": "Optional secondary y-axis column in time-series plots."},
         {"group": "models", "name": "KMEANS_FEATURE_MODE", "value": config["KMEANS_FEATURE_MODE"], "what_it_controls": "Whether k-means reads window summaries or row-level features."},
         {"group": "models", "name": "DEFAULT_SEQUENCE_OUTPUT_MODE", "value": config["DEFAULT_SEQUENCE_OUTPUT_MODE"], "what_it_controls": "Default CNN/Transformer prediction shape."},
+        {"group": "models", "name": "SEQUENCE_INDICATOR_CHANNELS", "value": config["SEQUENCE_INDICATOR_CHANNELS"], "what_it_controls": "Extra 0/1 range-check input channels for the CNN/Transformer."},
     ]

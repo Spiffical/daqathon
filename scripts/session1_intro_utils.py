@@ -22,6 +22,7 @@ from .parquet_cache_utils import (
     resolve_or_create_parquet_cache as _resolve_or_create_parquet_cache,
 )
 from .session1_modeling import (
+    add_indicator_channels,
     DEFAULT_FLAG_PALETTE,
     build_labeled_intervals,
     build_model_frame,
@@ -1698,6 +1699,7 @@ def show_cnn_interval_demo(
     range_start: str | pd.Timestamp | None = None,
     range_end: str | pd.Timestamp | None = None,
     auto_select_test_range: bool = True,
+    range_selection: dict[str, object] | None = None,
     max_points_to_plot: int | None = 1024,
     plot_measurement_column: str | None = None,
     plot_secondary_column: str | None = None,
@@ -1715,8 +1717,10 @@ def show_cnn_interval_demo(
     - ``output_mode="per_timestep"`` predicts one label for every timestamp
       inside each complete window.
 
-    The selected interval is usually taken from ``test_df`` so the visual check
-    stays held out from training.
+    Pass ``range_selection`` (the result of ``select_time_range``) when the
+    range was already chosen in an earlier cell. Otherwise the helper chooses
+    one from ``range_start``/``range_end``, usually inside ``test_df`` so the
+    visual check stays held out from training.
     """
 
     if not cnn_run:
@@ -1755,15 +1759,18 @@ def show_cnn_interval_demo(
 
     # Pick the time span to visualise. With auto-selection enabled, this looks
     # inside the test split for a compact range that includes labelled examples.
-    cnn_range_selection = select_time_range(
-        test_df,
-        time_column="Time UTC",
-        label_column=target_flag,
-        start=range_start,
-        end=range_end,
-        auto_select=auto_select_test_range,
-        max_points=max_points_to_plot,
-    )
+    if range_selection is not None:
+        cnn_range_selection = range_selection
+    else:
+        cnn_range_selection = select_time_range(
+            test_df,
+            time_column="Time UTC",
+            label_column=target_flag,
+            start=range_start,
+            end=range_end,
+            auto_select=auto_select_test_range,
+            max_points=max_points_to_plot,
+        )
 
     # Load only the raw rows needed for this one interval, then rebuild the
     # same model-ready columns that the training cells used.
@@ -1794,6 +1801,12 @@ def show_cnn_interval_demo(
         (cnn_interval_model_df["Time UTC"] >= cnn_range_selection["start"])
         & (cnn_interval_model_df["Time UTC"] <= cnn_range_selection["end"])
     ].reset_index(drop=True)
+    # Add the same optional range-check channels the CNN was trained with, in the same order.
+    cnn_interval_model_df, cnn_indicator_columns = add_indicator_channels(
+        cnn_interval_model_df,
+        cnn_config.get("indicator_channels"),
+    )
+    cnn_input_columns = list(measurement_columns) + cnn_indicator_columns
 
     # Record whether the interval came from train/validation/test so readers can
     # confirm that the demo is usually using held-out test data.
@@ -1818,7 +1831,7 @@ def show_cnn_interval_demo(
         # that one window label during data preparation.
         cnn_interval_bundle = build_window_classification_interval_data(
             cnn_interval_model_df,
-            feature_columns=list(measurement_columns),
+            feature_columns=cnn_input_columns,
             target_column="model_target",
             task_mode=task_mode,
             window_size=int(cnn_config["window_size"]),
@@ -1912,7 +1925,7 @@ def show_cnn_interval_demo(
         # complete window receives its own true label and predicted label.
         cnn_interval_bundle = build_sequence_label_interval_data(
             cnn_interval_model_df,
-            feature_columns=list(measurement_columns),
+            feature_columns=cnn_input_columns,
             target_column="model_target",
             window_size=int(cnn_config["window_size"]),
         )

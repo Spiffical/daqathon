@@ -40,6 +40,11 @@ from .session1_defaults import CTD_MEASUREMENT_COLUMNS
 #   "per_timestep" predicts one label at each timestamp inside a window.
 # - default_sequence_target_strategy: default label-collapsing strategy for CNN
 #   and Transformer examples.
+# - sequence_indicator_channels: optional extra 0/1 input channels for the CNN and
+#   Transformer, one per range check, e.g. {"column": "Turbidity (NTU)", "below": 0.0}
+#   adds a channel that is 1 when turbidity is below zero. Use these when a QC flag
+#   is a simple range check that standardised inputs would hide. Each entry needs a
+#   "column" and either "below" or "above".
 # - cache_read_sample_rows: optional row cap for cache-read demos on large data.
 # - auto_build_missing_cache: whether the notebook may build a missing cache.
 # - default_prep_sample_rows: optional per-file row cap when rebuilding caches.
@@ -71,6 +76,7 @@ CUSTOM_DATASET_TEMPLATE: dict[str, Any] = {
     "kmeans_feature_mode": "row_level",
     "default_sequence_output_mode": "per_timestep",
     "default_sequence_target_strategy": "raw_multiclass",
+    "sequence_indicator_channels": [],
     "cache_read_sample_rows": None,
     "auto_build_missing_cache": False,
     "default_prep_sample_rows": None,
@@ -95,6 +101,7 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "kmeans_feature_mode": "window_summary",
         "default_sequence_output_mode": "window",
         "default_sequence_target_strategy": "collapsed_1_34_9",
+        "sequence_indicator_channels": [],
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
@@ -130,6 +137,9 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "kmeans_feature_mode": "row_level",
         "default_sequence_output_mode": "per_timestep",
         "default_sequence_target_strategy": "collapsed_1_34_9",
+        # Turbidity QC flag 4 marks readings below 0 NTU. Standardised inputs hide that
+        # 0.02 NTU gap, so the CNN and Transformer get the range check as its own channel.
+        "sequence_indicator_channels": [{"column": "Turbidity (NTU)", "below": 0.0}],
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
@@ -157,6 +167,7 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "kmeans_feature_mode": "window_summary",
         "default_sequence_output_mode": "window",
         "default_sequence_target_strategy": "collapsed_12_34_9",
+        "sequence_indicator_channels": [],
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
@@ -194,6 +205,7 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "kmeans_feature_mode": "window_summary",
         "default_sequence_output_mode": "per_timestep",
         "default_sequence_target_strategy": "raw_multiclass",
+        "sequence_indicator_channels": [],
         "cache_read_sample_rows": 250_000,
         "auto_build_missing_cache": False,
         "default_prep_sample_rows": 500_000,

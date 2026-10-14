@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -21,7 +22,7 @@ from matplotlib.patches import Patch
 from sklearn.cluster import KMeans
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, recall_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -466,10 +467,13 @@ def sample_frame_by_strategy(
     target fraction of reviewed rows that should come from issue labels. If the
     full training split has too few issue rows to hit that target, the sampler
     keeps all available issue rows and fills the remaining budget with good rows.
+
+    ``full_train`` keeps the complete input frame without further shrinking,
+    matching the strategy of the same name in the data-preparation notebook.
     """
 
     work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
-    if rows_limit is None or len(work) <= rows_limit:
+    if rows_limit is None or len(work) <= rows_limit or sample_strategy == "full_train":
         return work
 
     normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
@@ -1972,6 +1976,63 @@ def select_time_range(
     }
 
 
+def describe_time_range_selection(
+    selection: dict[str, object],
+    *,
+    reference_frame: pd.DataFrame,
+    reference_name: str = "test split",
+    variable_prefix: str = "RANGE",
+    time_column: str = "Time UTC",
+    label_meanings: dict[int, str] | None = None,
+) -> str:
+    """Explain a ``select_time_range`` result in plain, copy-pasteable text.
+
+    The text states the exact start/end timestamps (including the year), how the
+    range was chosen, which dates the reference split covers, and an example of
+    the ``<prefix>_RANGE_START`` / ``<prefix>_RANGE_END`` lines a participant
+    can paste into the settings cell to pick their own range.
+    """
+    start = pd.Timestamp(selection["start"])
+    end = pd.Timestamp(selection["end"])
+    duration_hours = (end - start).total_seconds() / 3600
+    time_format = "%Y-%m-%d %H:%M:%S UTC"
+
+    lines = [f"Selected range: {start:{time_format}} → {end:{time_format}} ({duration_hours:.1f} hours)"]
+    if selection.get("selection_mode") == "explicit":
+        lines.append(f"How it was chosen: from your {variable_prefix}_RANGE_START / {variable_prefix}_RANGE_END values.")
+        if len(selection.get("slice", [])) == 0:
+            lines.append(
+                f"Note: no {reference_name} rows fall inside this range, so the plotted rows may come from "
+                "training or validation data."
+            )
+    else:
+        selected_label = selection.get("selected_label")
+        if selected_label is None:
+            lines.append(f"How it was chosen: default range from the middle of the {reference_name}.")
+        else:
+            meaning = (label_meanings or {}).get(int(selected_label))
+            label_text = f"label {int(selected_label)}" + (f" ({meaning})" if meaning else "")
+            lines.append(
+                f"How it was chosen: default range, centred on a {label_text} example in the {reference_name}."
+            )
+
+    reference_times = pd.to_datetime(reference_frame[time_column], utc=True)
+    span_start = reference_times.min()
+    span_end = reference_times.max()
+    lines.append(f"The {reference_name} covers {span_start:%Y-%m-%d %H:%M} UTC → {span_end:%Y-%m-%d %H:%M} UTC.")
+
+    example_start = max(start.floor("D"), span_start.ceil("D"))
+    example_end = min(example_start + pd.Timedelta(days=1), span_end.floor("min"))
+    lines.extend(
+        [
+            "To choose your own range, set two UTC strings inside that span, for example:",
+            f'    {variable_prefix}_RANGE_START = "{example_start:%Y-%m-%d %H:%M:%S}Z"',
+            f'    {variable_prefix}_RANGE_END = "{example_end:%Y-%m-%d %H:%M:%S}Z"',
+        ]
+    )
+    return "\n".join(lines)
+
+
 def infer_interval_origin(
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
@@ -2170,8 +2231,18 @@ def plot_time_series_with_bands(
                 frameon=True,
             )
 
+    # ConciseDateFormatter keeps tick labels short and adds the year/date as an
+    # offset label, so the full date is visible even on short ranges.
+    date_locator = mdates.AutoDateLocator(minticks=4, maxticks=9)
+    axes[-1].xaxis.set_major_locator(date_locator)
+    axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
     axes[-1].set_xlabel("Time UTC")
-    fig.suptitle(title, y=1.01)
+    range_start = plot_frame["Time UTC"].min()
+    range_end = plot_frame["Time UTC"].max()
+    fig.suptitle(
+        f"{title}\n{range_start:%Y-%m-%d %H:%M} → {range_end:%Y-%m-%d %H:%M} UTC",
+        y=1.03,
+    )
     fig.tight_layout(rect=(0, 0, 0.84, 1))
     return fig
 
@@ -2914,7 +2985,8 @@ def fit_kmeans(
     feature_columns: list[str] | None = None,
     time_column: str = "Time UTC",
     source_column: str = "source_file",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return_model: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, Pipeline]:
     """Fit k-means on either window summaries or row-level features.
 
     Parameters
@@ -2926,6 +2998,10 @@ def fit_kmeans(
         `"row_level"` clusters on the explicit `feature_columns`.
     feature_columns:
         Required for row-level mode. These columns become the clustering input.
+    return_model:
+        When True, also return the fitted imputer → scaler → k-means pipeline,
+        so new windows or rows can be assigned to the learned clusters with
+        ``model.predict(new_frame[model.feature_names_in_])``.
     """
 
     if feature_mode == "window_summary":
@@ -2962,15 +3038,18 @@ def fit_kmeans(
     else:
         raise ValueError(f"Unsupported k-means feature_mode: {feature_mode}")
 
-    cluster_input = result[cluster_feature_columns]
-    cluster_input = pd.DataFrame(
-        SimpleImputer(strategy="median").fit_transform(cluster_input),
-        columns=cluster_feature_columns,
+    # Fill gaps, standardise every feature to mean 0 / std 1, then cluster.
+    cluster_model = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("kmeans", KMeans(n_clusters=n_clusters, random_state=seed, n_init=n_init)),
+        ]
     )
-    cluster_scaled = StandardScaler().fit_transform(cluster_input)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=seed, n_init=n_init)
-    result["cluster"] = kmeans.fit_predict(cluster_scaled)
-    result["distance_to_centroid"] = kmeans.transform(cluster_scaled).min(axis=1)
+    cluster_input = result[cluster_feature_columns]
+    result["cluster"] = cluster_model.fit_predict(cluster_input)
+    # transform() returns the distance from each example to every centroid.
+    result["distance_to_centroid"] = cluster_model.transform(cluster_input).min(axis=1)
     summary = (
         result.groupby("cluster")
         .agg(
@@ -2983,6 +3062,8 @@ def fit_kmeans(
         )
         .sort_index()
     )
+    if return_model:
+        return result, summary, cluster_model
     return result, summary
 
 
@@ -3335,6 +3416,214 @@ def _require_torch() -> None:
     """Raise a clear error when PyTorch is unavailable in the current environment."""
     if torch is None or nn is None or DataLoader is None or TensorDataset is None:
         raise ImportError("PyTorch is required for the CNN sections.")
+
+
+SUPPORTED_SEQUENCE_LOSSES = (
+    "weighted_cross_entropy",
+    "sqrt_weighted_cross_entropy",
+    "cross_entropy",
+    "focal",
+)
+
+
+if nn is not None:
+
+    class FocalLoss(nn.Module):
+        """Cross-entropy that down-weights examples the model already gets right.
+
+        Each example's loss is multiplied by ``(1 - p_correct) ** gamma``. Easy,
+        confident examples (usually the common "good" class) contribute very
+        little, so training concentrates on the hard examples without giving
+        any class a fixed weight. ``gamma=0`` is plain cross-entropy.
+        """
+
+        def __init__(self, gamma: float = 2.0, binary: bool = False) -> None:
+            super().__init__()
+            self.gamma = float(gamma)
+            self.binary = bool(binary)
+
+        def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            if self.binary:
+                per_example_loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+            else:
+                per_example_loss = nn.functional.cross_entropy(logits, targets, reduction="none")
+            probability_correct = torch.exp(-per_example_loss)
+            return ((1.0 - probability_correct) ** self.gamma * per_example_loss).mean()
+
+
+def build_classification_loss(
+    train_targets: np.ndarray,
+    *,
+    task_mode: str,
+    class_labels: list[int] | tuple[int, ...],
+    loss_name: str = "weighted_cross_entropy",
+    focal_gamma: float = 2.0,
+    device: str | object = "cpu",
+) -> tuple[object, pd.DataFrame]:
+    """Build the training loss used by the CNN and Transformer sections.
+
+    Options for ``loss_name``:
+
+    - ``"weighted_cross_entropy"``: each class is weighted by
+      ``total / (n_classes * class_count)``. Every class then contributes the
+      same share of the training loss, however rare it is.
+    - ``"sqrt_weighted_cross_entropy"``: the square root of those weights. Rare
+      classes still count more, but much less aggressively.
+    - ``"cross_entropy"``: no class weighting. Each example counts equally, so
+      the common class dominates the loss.
+    - ``"focal"``: no class weighting, but easy examples are down-weighted by
+      ``(1 - p_correct) ** focal_gamma`` (see ``FocalLoss``).
+
+    Returns the loss module and a table showing, for each class, its training
+    count, its loss weight, and the share of the starting training loss it
+    contributes. That last column is the quickest way to see what a weighting
+    choice actually does.
+    """
+    _require_torch()
+    if loss_name not in SUPPORTED_SEQUENCE_LOSSES:
+        raise ValueError(f"loss_name must be one of {SUPPORTED_SEQUENCE_LOSSES}, got {loss_name!r}.")
+
+    flat_targets = np.asarray(train_targets).reshape(-1).astype(int)
+    if task_mode == "multiclass":
+        table_labels = [int(label) for label in class_labels]
+        class_counts = np.bincount(flat_targets, minlength=len(table_labels)).clip(min=1)
+    else:
+        table_labels = [0, 1]
+        class_counts = np.bincount(flat_targets, minlength=2).clip(min=1)
+
+    inverse_frequency = flat_targets.size / (len(class_counts) * class_counts)
+    if loss_name == "weighted_cross_entropy":
+        class_weights = inverse_frequency
+    elif loss_name == "sqrt_weighted_cross_entropy":
+        class_weights = np.sqrt(inverse_frequency)
+    else:
+        class_weights = np.ones(len(class_counts))
+
+    if task_mode == "multiclass":
+        if loss_name == "focal":
+            loss_fn = FocalLoss(gamma=focal_gamma, binary=False)
+        else:
+            loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
+    else:
+        # Binary models emit one logit, so the weighting is a single pos_weight
+        # applied to the issue class relative to the good class.
+        class_weights = class_weights / class_weights[0]
+        if loss_name == "focal":
+            loss_fn = FocalLoss(gamma=focal_gamma, binary=True)
+        else:
+            pos_weight = torch.tensor([float(class_weights[1])], dtype=torch.float32, device=device)
+            loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    weighted_counts = class_counts * class_weights
+    weight_table = pd.DataFrame(
+        {
+            "class": table_labels,
+            "train_count": class_counts.astype(int),
+            "train_share": class_counts / class_counts.sum(),
+            "loss_weight": class_weights,
+            "share_of_starting_loss": weighted_counts / weighted_counts.sum(),
+        }
+    ).set_index("class")
+    return loss_fn, weight_table.round({"train_share": 4, "loss_weight": 3, "share_of_starting_loss": 3})
+
+
+def per_class_recall(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    class_labels: list[int] | tuple[int, ...],
+) -> dict[str, float]:
+    """Return recall for each class, keyed by the original class label.
+
+    ``y_true`` and ``y_pred`` hold class indexes (``0..n_classes-1``), which is
+    what the CNN and Transformer training loops produce.
+    """
+    class_indexes = list(range(len(class_labels)))
+    recalls = recall_score(
+        np.asarray(y_true).astype(int),
+        np.asarray(y_pred).astype(int),
+        labels=class_indexes,
+        average=None,
+        zero_division=0,
+    )
+    return {str(label): round(float(value), 3) for label, value in zip(class_labels, recalls)}
+
+
+def indicator_channel_name(spec: dict[str, object]) -> str:
+    """Return the column name for one range-check indicator, e.g. ``"Turbidity (NTU) < 0"``."""
+    if "below" in spec:
+        return f"{spec['column']} < {float(spec['below']):g}"
+    if "above" in spec:
+        return f"{spec['column']} > {float(spec['above']):g}"
+    raise ValueError(f"Indicator spec needs 'below' or 'above': {spec!r}")
+
+
+def add_indicator_channels(
+    frame: pd.DataFrame,
+    indicator_specs: list[dict[str, object]] | None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add 0/1 range-check columns used as extra CNN/Transformer input channels.
+
+    Each spec names a measurement column and a limit, for example
+    ``{"column": "Turbidity (NTU)", "below": 0.0}`` adds a column that is 1
+    where turbidity is below zero. Some QC flags are exactly this kind of range
+    check, and standardised inputs can hide a small gap around the limit, so
+    giving the rule its own channel lets a network use it directly.
+
+    Use the same specs when training and when predicting on new rows, so the
+    model always sees the same input columns in the same order. Missing values
+    count as 0 (the check did not fire).
+    """
+    if not indicator_specs:
+        return frame, []
+    result = frame.copy()
+    indicator_columns = []
+    for spec in indicator_specs:
+        column = str(spec["column"])
+        if column not in result.columns:
+            raise ValueError(f"Indicator column {column!r} is not in the frame.")
+        values = pd.to_numeric(result[column], errors="coerce")
+        if "below" in spec:
+            fired = values < float(spec["below"])
+        elif "above" in spec:
+            fired = values > float(spec["above"])
+        else:
+            raise ValueError(f"Indicator spec needs 'below' or 'above': {spec!r}")
+        name = indicator_channel_name(spec)
+        result[name] = fired.astype(np.float32)
+        indicator_columns.append(name)
+    return result, indicator_columns
+
+
+def describe_indicator_channels(
+    frame: pd.DataFrame,
+    indicator_columns: list[str],
+    *,
+    target_flag: str,
+    issue_labels: list[int] | tuple[int, ...],
+) -> pd.DataFrame:
+    """Show how well each indicator channel matches the issue labels on its own.
+
+    ``share_of_fired_rows_that_are_issues`` is the indicator's precision, and
+    each ``share_of_label_<L>_rows_caught`` column is its recall for one issue
+    label. Values near 1 for both mean that label is essentially this range check.
+    """
+    labels = pd.to_numeric(frame[target_flag], errors="coerce")
+    present_issue_labels = [int(label) for label in issue_labels if (labels == label).any()]
+    is_issue = labels.isin(present_issue_labels)
+    rows = []
+    for column in indicator_columns:
+        fired = frame[column] > 0.5
+        row = {
+            "indicator": column,
+            "rows_where_it_fires": int(fired.sum()),
+            "share_of_fired_rows_that_are_issues": round(float((fired & is_issue).sum() / max(int(fired.sum()), 1)), 3),
+        }
+        for label in present_issue_labels:
+            label_rows = labels == label
+            row[f"share_of_label_{label}_rows_caught"] = round(float((fired & label_rows).sum() / max(int(label_rows.sum()), 1)), 3)
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("indicator")
 
 
 def train_cnn_model(

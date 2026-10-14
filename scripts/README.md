@@ -8,6 +8,7 @@ Participant-editable workshop values live in `../workshop_config/`.
 - `session1_intro_notebook_setup.py`: imports and path setup shared by the notebooks.
 - `session1_intro_utils.py`: plotting, cache inspection, split visualisation, and notebook display helpers.
 - `session1_modeling.py`: train/test split helpers, feature construction, model training, evaluation, and plotting.
+- `session1_concept_demos.py`: small synthetic figures that explain k-means iterations and CNN filters before the real-data sections.
 - `session1_profiles.py`: resolver functions that read `workshop_config/` values and produce notebook variables.
 - `session1_resume_utils.py`: skip-ahead setup for ML sections.
 - `session1_notebook_bootstrap.py`: small bootstrap helpers used near the top of notebooks.

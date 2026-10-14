@@ -167,6 +167,9 @@ def load_ml_section_state(
     issue_rows_per_file: int | None = None,
     balanced_reviewed_target_issue_share: float = 0.25,
     interleaved_block_rows: int = 1024,
+    episode_context_rows: int = 512,
+    episode_merge_gap_rows: int = 128,
+    episode_purge_gap_rows: int = 256,
     train_fraction: float = 0.70,
     validation_fraction: float = 0.15,
     seed: int = 21,
@@ -207,6 +210,11 @@ def load_ml_section_state(
     the actual usable reviewed rows, plus the train-only subset cap. For
     example, ``0.1`` gives a quick 10% reviewed-row run and ``0.9`` gives a
     much larger 90% reviewed-row run. Use ``1.0`` to remove row caps.
+
+    The ``episode_*`` settings are only used when ``split_strategy`` is
+    ``"episode_aware"``: they set how many clean rows stay with each issue
+    episode, how close issue stretches must be to merge into one episode, and
+    how many buffer rows are removed at split boundaries.
 
     Set ``use_data_fraction_budgets=False`` to keep every reviewed row for the
     setup-time dataset and train-subset steps. Model-specific row/window caps
@@ -484,6 +492,9 @@ def load_ml_section_state(
         issue_column="issue",
         target_column=target_flag,
         issue_labels=issue_labels,
+        episode_context_rows=episode_context_rows,
+        episode_merge_gap_rows=episode_merge_gap_rows,
+        purge_gap_rows=episode_purge_gap_rows,
     )
     train_full_df = fixed_split_frames["train"].reset_index(drop=True)
     valid_df = fixed_split_frames["validation"].reset_index(drop=True)
@@ -527,6 +538,7 @@ def load_ml_section_state(
         "KMEANS_FEATURE_MODE": kmeans_feature_mode,
         "DEFAULT_SEQUENCE_OUTPUT_MODE": profile.get("default_sequence_output_mode", "window"),
         "DEFAULT_SEQUENCE_TARGET_STRATEGY": profile.get("default_sequence_target_strategy", "collapsed_1_34_9"),
+        "SEQUENCE_INDICATOR_CHANNELS": [dict(spec) for spec in profile.get("sequence_indicator_channels", [])],
         "RAW_CACHE_READ_SAMPLE_ROWS": profile.get("cache_read_sample_rows"),
         "AUTO_BUILD_MISSING_CACHE": bool(profile.get("auto_build_missing_cache", True)),
         "DEFAULT_PREP_SAMPLE_ROWS": profile.get("default_prep_sample_rows"),
@@ -615,6 +627,7 @@ def load_ml_section_state(
             "KMEANS_FEATURE_MODE": kmeans_feature_mode,
             "DEFAULT_SEQUENCE_OUTPUT_MODE": profile.get("default_sequence_output_mode", "window"),
             "DEFAULT_SEQUENCE_TARGET_STRATEGY": profile.get("default_sequence_target_strategy", "collapsed_1_34_9"),
+            "SEQUENCE_INDICATOR_CHANNELS": [dict(spec) for spec in profile.get("sequence_indicator_channels", [])],
             "DATA_FRACTION": data_fraction,
             "USE_DATA_FRACTION_BUDGETS": use_data_fraction_budgets,
             "BUDGET_MODE": budget_mode,
@@ -662,7 +675,7 @@ def load_ml_section_state(
             "INTERLEAVED_BLOCK_ROWS": interleaved_block_rows,
             "SPLIT_BLOCK_ROWS": interleaved_block_rows,
             "ACTIVE_SPLIT_BLOCK_ROWS": interleaved_block_rows,
-            "FIXED_SPLIT_BLOCK_ROWS": interleaved_block_rows if split_strategy == "interleaved_blocks" else None,
+            "FIXED_SPLIT_BLOCK_ROWS": interleaved_block_rows if split_strategy in {"interleaved_blocks", "episode_aware"} else None,
             "fixed_split_frames": fixed_split_frames,
             "train_full_df": train_full_df,
             "valid_df": valid_df,
@@ -680,9 +693,9 @@ def load_ml_section_state(
             "evenly_spaced_take": evenly_spaced_take,
             "RUN_HYPERPARAMETER_SEARCH": True,
             "AUTO_SELECT_SPLIT_BLOCK_ROWS": False,
-            "EPISODE_CONTEXT_ROWS": 0,
-            "EPISODE_MERGE_GAP_ROWS": 0,
-            "EPISODE_PURGE_GAP_ROWS": 0,
+            "EPISODE_CONTEXT_ROWS": episode_context_rows,
+            "EPISODE_MERGE_GAP_ROWS": episode_merge_gap_rows,
+            "EPISODE_PURGE_GAP_ROWS": episode_purge_gap_rows,
             "ML_SECTION_STATE_SUMMARY": setup_summary,
         }
     )

@@ -6,13 +6,13 @@ The main notebooks are:
 
 - `notebooks/session1_data_preparation.ipynb`
 - `notebooks/session1_machine_learning.ipynb`
-- `notebooks/advanced_session1_qc_workflow.ipynb`
+- `notebooks/session1_advanced_machine_learning.ipynb`
 
 Suggested session flow:
 
 - [Session 1 agenda](./docs/session1_agenda.md)
 
-Start with the data-preparation notebook when you want to understand or rebuild the parquet cache. Use the machine-learning notebook for the Random Forest, k-means, CNN, and transformer sections. Use the advanced notebook for deeper experiments after the main workflow.
+Start with the data-preparation notebook when you want to understand or rebuild the parquet cache. Use the machine-learning notebook for the Random Forest, k-means, CNN, and transformer sections. Use the advanced machine-learning notebook for deeper experiments after the main workflow.
 
 ## Quick Start On Narval Or FIR
 
@@ -140,13 +140,14 @@ Use `notebooks/session1_machine_learning.ipynb` when you want to run the modelli
 
 ### Advanced notebook
 
-Use `notebooks/advanced_session1_qc_workflow.ipynb` when you want to go deeper:
+Use `notebooks/session1_advanced_machine_learning.ipynb` when you want to go deeper. It starts from the same dataset setup as the machine-learning notebook (including an optional episode-aware split) and covers:
 
-- hyperparameter search
-- feature engineering
-- stronger tree models
+- Random Forest and CNN hyperparameter search
+- temporal context features and stronger tree models
 - alternative target definitions
-- sequence-labeling experiments
+- per-timestamp sequence-labelling CNN
+- a loss-function comparison for rare labels
+- a forecasting transformer that flags large prediction errors
 
 ## Where Outputs Go
 
@@ -190,6 +191,7 @@ The notebooks import the following runtime helpers:
 - `scripts/prepare_scalar_session1_data.py`
 - `scripts/session1_intro_utils.py`
 - `scripts/session1_modeling.py`
+- `scripts/session1_concept_demos.py`
 - `scripts/session1_resume_utils.py`
 
 ## Local Development

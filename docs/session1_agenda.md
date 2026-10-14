@@ -174,13 +174,13 @@ Estimated time: `10–15 min`
 Primary notebook sections:
 
 - `Part 8 — Reflection and Next Steps`
-- `notebooks/advanced_session1_qc_workflow.ipynb`
+- `notebooks/session1_advanced_machine_learning.ipynb`
 
 ## How The Notebooks Fit Together
 
 ### Data preparation notebook
 
-Use [session1_data_preparation.ipynb](/home/sbialek/ONC/DAQathon/notebooks/session1_data_preparation.ipynb) when you want to understand or rebuild the prepared parquet cache:
+Use [session1_data_preparation.ipynb](../notebooks/session1_data_preparation.ipynb) when you want to understand or rebuild the prepared parquet cache:
 
 - explore the data,
 - understand the prep workflow,
@@ -189,7 +189,7 @@ Use [session1_data_preparation.ipynb](/home/sbialek/ONC/DAQathon/notebooks/sessi
 
 ### Machine learning notebook
 
-Use [session1_machine_learning.ipynb](/home/sbialek/ONC/DAQathon/notebooks/session1_machine_learning.ipynb) when you want to run the modelling workflow:
+Use [session1_machine_learning.ipynb](../notebooks/session1_machine_learning.ipynb) when you want to run the modelling workflow:
 
 - load a prepared parquet cache,
 - build train/validation/test splits,
@@ -198,12 +198,12 @@ Use [session1_machine_learning.ipynb](/home/sbialek/ONC/DAQathon/notebooks/sessi
 
 ### Advanced notebook
 
-Use [advanced_session1_qc_workflow.ipynb](/home/sbialek/ONC/DAQathon/notebooks/advanced_session1_qc_workflow.ipynb) when you want to go deeper:
+Use [session1_advanced_machine_learning.ipynb](../notebooks/session1_advanced_machine_learning.ipynb) when you want to go deeper. It reuses the machine-learning notebook's dataset setup, then:
 
-- tune model settings,
-- experiment with feature engineering,
-- compare stronger model variants,
-- and extend the sequence-model examples.
+- tunes Random Forest and CNN settings,
+- experiments with temporal context features, tree families, and target definitions,
+- trains a per-timestamp sequence-labelling CNN and compares loss functions for rare labels,
+- and tries a forecasting transformer that flags large prediction errors.
 
 ## If You Have Extra Time
 
