@@ -315,6 +315,87 @@ def evenly_spaced_take(frame: pd.DataFrame, limit: int | None) -> pd.DataFrame:
     return frame.iloc[indices].reset_index(drop=True)
 
 
+def cut_into_row_blocks(
+    frame: pd.DataFrame,
+    *,
+    block_rows: int,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> list[pd.DataFrame]:
+    """Cut a dataframe into consecutive blocks of ``block_rows`` rows.
+
+    Blocks are cut inside each source file, so no block spans two files. The
+    returned list is ordered by each block's first timestamp.
+    """
+    if block_rows <= 0:
+        raise ValueError("block_rows must be positive")
+    if source_column in frame.columns:
+        source_frames = [source_frame for _, source_frame in frame.groupby(source_column, sort=False, observed=False)]
+    else:
+        source_frames = [frame]
+
+    blocks = []
+    for source_frame in source_frames:
+        source_frame = source_frame.sort_values(time_column)
+        for start in range(0, len(source_frame), block_rows):
+            blocks.append(source_frame.iloc[start : start + block_rows])
+    blocks.sort(key=lambda block: block[time_column].iloc[0])
+    return blocks
+
+
+def evenly_spaced_positions(count: int, limit: int) -> np.ndarray:
+    """Return up to ``limit`` positions spread evenly over ``range(count)``."""
+    if limit <= 0 or count <= 0:
+        return np.array([], dtype=int)
+    if count <= limit:
+        return np.arange(count)
+    return np.linspace(0, count - 1, num=limit, dtype=int)
+
+
+def join_row_blocks(
+    blocks: list[pd.DataFrame],
+    *,
+    rows_limit: int,
+    template: pd.DataFrame,
+    time_column: str = "Time UTC",
+) -> pd.DataFrame:
+    """Concatenate selected blocks in time order and keep at most ``rows_limit`` rows."""
+    if not blocks:
+        return template.iloc[0:0].copy()
+    joined = pd.concat(blocks).sort_values(time_column)
+    return joined.iloc[:rows_limit].reset_index(drop=True)
+
+
+def time_gap_segment_ids(
+    frame: pd.DataFrame,
+    *,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+    gap_factor: float = 5.0,
+) -> np.ndarray:
+    """Number the unbroken stretches of rows in a time-sorted dataframe.
+
+    A new stretch starts when the source file changes or when the time since
+    the previous row is more than ``gap_factor`` times the usual row spacing.
+    Block-based subsets and splits leave jumps like this between kept blocks,
+    and features that compare neighbouring rows should not reach across them.
+    """
+    if frame.empty or time_column not in frame.columns:
+        return np.zeros(len(frame), dtype=np.int64)
+    seconds = pd.to_datetime(frame[time_column], utc=True).diff().dt.total_seconds().to_numpy()
+    starts_new_stretch = np.zeros(len(frame), dtype=bool)
+    starts_new_stretch[0] = True
+    if source_column in frame.columns:
+        source_values = frame[source_column].astype(str).to_numpy()
+        starts_new_stretch[1:] |= source_values[1:] != source_values[:-1]
+    steps = seconds[~starts_new_stretch]
+    steps = steps[np.isfinite(steps) & (steps > 0)]
+    if steps.size:
+        usual_spacing = float(np.median(steps))
+        starts_new_stretch |= np.nan_to_num(seconds, nan=0.0) > gap_factor * usual_spacing
+    return np.cumsum(starts_new_stretch) - 1
+
+
 def select_part_paths(part_paths: list[Path], limit: int | None, mode: str = "spread") -> list[Path]:
     """Choose parquet parts either from the front or spread across the full time range."""
     if limit is None or limit >= len(part_paths):
@@ -410,15 +491,8 @@ def load_row_level_sample(
 ) -> pd.DataFrame:
     """Load a row-level sample from each parquet part using one sampling strategy.
 
-    Supported strategies:
-
-    - ``time_spread``: keep an evenly spaced slice from the full parquet part.
-    - ``issue_focused``: start from a time-spread slice, then add extra reviewed
-      issue rows before trimming back to ``rows_per_file``.
-    - ``balanced_reviewed``: move the reviewed sample toward a configurable
-      issue share by drawing from the reviewed good and reviewed issue groups
-      separately. ``balanced_issue_share`` controls the target reviewed issue
-      fraction for that mode.
+    Each part is sampled with ``sample_frame_by_strategy``, which keeps
+    contiguous row blocks. See that function for the supported strategies.
     """
     row_frames = []
     for path in part_paths:
@@ -451,127 +525,85 @@ def sample_frame_by_strategy(
     issue_labels: list[int] | tuple[int, ...] | None = None,
     issue_rows: int = 0,
     balanced_issue_share: float = 0.5,
+    block_rows: int = 256,
 ) -> pd.DataFrame:
-    """Sample one dataframe according to a notebook sampling strategy.
+    """Shrink one dataframe to ``rows_limit`` rows by keeping contiguous row blocks.
 
-    This is used in two places:
+    This is used to shrink the training split in the fixed-split modelling flow
+    and to cap the rows a model section reads from any split.
 
-    - when creating a lightweight inspection sample from the cache, and
-    - when shrinking only the training split in the fixed-split modelling flow.
+    The frame is cut into blocks of ``block_rows`` consecutive rows inside each
+    source file, and the strategy decides which whole blocks to keep. Keeping
+    blocks instead of isolated rows means neighbouring kept rows are as far
+    apart in time as they are in the unsampled splits, so CNN/Transformer
+    windows and change features such as ``abs_delta`` mean the same thing in
+    train, validation, and test.
+
+    - ``time_spread``: keep evenly spaced blocks across the full time range.
+    - ``issue_focused``: keep evenly spaced blocks that contain issue rows, enough
+      to hold about ``issue_rows`` issue rows, then fill the rest of the budget
+      with evenly spaced blocks.
+    - ``balanced_reviewed``: keep the blocks with the most issue rows until they
+      hold about ``balanced_issue_share`` of the budget as issue rows, then fill
+      the rest with evenly spaced blocks whose rows all have good labels. The
+      share is a target, not a guarantee: issue rows sit inside blocks with good
+      rows, and rare issues can run out first.
+    - ``full_train``: keep the complete input frame, matching the strategy of the
+      same name in the data-preparation notebook.
 
     ``rows_limit`` is the maximum number of rows to return. Use ``None`` to
-    keep the full input frame. The sampling strategy controls which rows are
-    kept when the input frame is larger than that limit.
-
-    ``balanced_issue_share`` is only used by ``balanced_reviewed``. It sets a
-    target fraction of reviewed rows that should come from issue labels. If the
-    full training split has too few issue rows to hit that target, the sampler
-    keeps all available issue rows and fills the remaining budget with good rows.
-
-    ``full_train`` keeps the complete input frame without further shrinking,
-    matching the strategy of the same name in the data-preparation notebook.
+    keep the full input frame.
     """
 
     work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
     if rows_limit is None or len(work) <= rows_limit or sample_strategy == "full_train":
         return work
+    if sample_strategy not in {"time_spread", "issue_focused", "balanced_reviewed"}:
+        raise ValueError(f"Unsupported sample_strategy: {sample_strategy}")
 
-    normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
+    blocks = cut_into_row_blocks(work, block_rows=block_rows)
+    block_limit = max(1, int(np.ceil(rows_limit / block_rows)))
+
+    if sample_strategy == "time_spread" or target_flag not in work.columns:
+        kept_blocks = [blocks[position] for position in evenly_spaced_positions(len(blocks), block_limit)]
+        return join_row_blocks(kept_blocks, rows_limit=rows_limit, template=work)
+
+    # Count the issue rows inside every block so the strategies can choose whole blocks.
     normalized_issue_labels = normalize_label_list(issue_labels, DEFAULT_ISSUE_LABELS)
-
-    if sample_strategy == "time_spread":
-        return evenly_spaced_take(work, rows_limit)
+    issue_counts = np.array([int(issue_mask(block[target_flag], normalized_issue_labels).sum()) for block in blocks])
+    issue_positions = np.flatnonzero(issue_counts > 0)
 
     if sample_strategy == "issue_focused":
-        base_limit = max(rows_limit - issue_rows, 0)
-        sampled_frame = evenly_spaced_take(work, base_limit)
-        if issue_rows > 0 and target_flag in work.columns:
-            issue_frame = work[issue_mask(work[target_flag], normalized_issue_labels)].reset_index(drop=True)
-            issue_sample = evenly_spaced_take(issue_frame, issue_rows)
-            sampled_frame = pd.concat([sampled_frame, issue_sample], ignore_index=True)
-            sampled_frame = sampled_frame.drop_duplicates(subset=["Time UTC"]).sort_values("Time UTC")
-        return evenly_spaced_take(sampled_frame, rows_limit)
-
-    if sample_strategy == "balanced_reviewed":
+        # Each issue block holds this many issue rows on average, so this many blocks hold about issue_rows.
+        issue_block_count = 0
+        if issue_rows > 0 and len(issue_positions):
+            mean_issue_rows = float(issue_counts[issue_positions].mean())
+            issue_block_count = min(int(np.ceil(issue_rows / mean_issue_rows)), block_limit)
+        chosen = set(issue_positions[evenly_spaced_positions(len(issue_positions), issue_block_count)].tolist())
+        fill_candidates = np.array([position for position in range(len(blocks)) if position not in chosen], dtype=int)
+    else:
         if not 0 < balanced_issue_share < 1:
             raise ValueError("balanced_issue_share must be in the open interval (0, 1)")
-        reviewed_frame = work[
-            reviewed_label_mask(
-                work[target_flag],
-                good_labels=normalized_good_labels,
-                issue_labels=normalized_issue_labels,
-            )
-        ].reset_index(drop=True)
-        if reviewed_frame.empty:
-            return evenly_spaced_take(work, rows_limit)
-
-        good_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_good_labels)].reset_index(drop=True)
-        issue_frame = reviewed_frame[reviewed_frame[target_flag].astype(int).isin(normalized_issue_labels)].reset_index(drop=True)
-        dedupe_columns = [
-            column
-            for column in ("source_file", "Time UTC")
-            if column in reviewed_frame.columns
-        ]
-
-        def _sample_group(group_frame: pd.DataFrame, group_labels: list[int], target_rows: int) -> pd.DataFrame:
-            if group_frame.empty or target_rows <= 0:
-                return group_frame.iloc[0:0].copy()
-            present_labels = [label for label in group_labels if label in set(group_frame[target_flag].astype(int).unique().tolist())]
-            if not present_labels:
-                return evenly_spaced_take(group_frame, target_rows)
-            per_label_limit = max(int(np.ceil(target_rows / len(present_labels))), 1)
-            label_samples = []
-            for label in present_labels:
-                label_frame = group_frame[group_frame[target_flag].astype(int) == label].reset_index(drop=True)
-                label_samples.append(evenly_spaced_take(label_frame, per_label_limit))
-            group_sample = pd.concat(label_samples, ignore_index=True)
-            if dedupe_columns:
-                group_sample = group_sample.drop_duplicates(subset=dedupe_columns)
-            else:
-                group_sample = group_sample.drop_duplicates()
-            group_sample = group_sample.sort_values("Time UTC")
-            if len(group_sample) < target_rows:
-                group_fill = evenly_spaced_take(group_frame, target_rows)
-                group_sample = pd.concat([group_sample, group_fill], ignore_index=True)
-                if dedupe_columns:
-                    group_sample = group_sample.drop_duplicates(subset=dedupe_columns)
-                else:
-                    group_sample = group_sample.drop_duplicates()
-                group_sample = group_sample.sort_values("Time UTC")
-            return evenly_spaced_take(group_sample, target_rows)
-
         issue_target = int(round(rows_limit * balanced_issue_share))
-        issue_target = min(max(issue_target, 0), rows_limit)
-        issue_target = min(issue_target, len(issue_frame))
-        good_target = rows_limit - issue_target
+        # Most issue-dense blocks first, until they hold about issue_target issue rows.
+        densest_positions = issue_positions[np.argsort(-issue_counts[issue_positions], kind="stable")]
+        cumulative_issue_rows = np.cumsum(issue_counts[densest_positions])
+        issue_block_count = int(np.searchsorted(cumulative_issue_rows, issue_target)) + 1 if issue_target > 0 else 0
+        issue_block_count = min(issue_block_count, len(densest_positions), block_limit)
+        chosen = set(densest_positions[:issue_block_count].tolist())
+        normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
+        good_only = np.array(
+            [bool(pd.to_numeric(block[target_flag], errors="coerce").isin(normalized_good_labels).all()) for block in blocks]
+        )
+        fill_candidates = np.flatnonzero(good_only)
+        if len(fill_candidates) < block_limit - len(chosen):
+            # Too few good-only blocks: fill from every block that is not already chosen.
+            fill_candidates = np.array([position for position in range(len(blocks)) if position not in chosen], dtype=int)
 
-        good_sample = _sample_group(good_frame, normalized_good_labels, good_target)
-        issue_sample = _sample_group(issue_frame, normalized_issue_labels, issue_target)
-
-        sampled_frame = pd.concat([good_sample, issue_sample], ignore_index=True)
-        if dedupe_columns:
-            sampled_frame = sampled_frame.drop_duplicates(subset=dedupe_columns)
-        else:
-            sampled_frame = sampled_frame.drop_duplicates()
-        sampled_frame = sampled_frame.sort_values("Time UTC").reset_index(drop=True)
-        if len(sampled_frame) < rows_limit:
-            if dedupe_columns and not sampled_frame.empty:
-                selected_keys = set(map(tuple, sampled_frame[dedupe_columns].to_numpy()))
-                fill_candidates = reviewed_frame[
-                    ~reviewed_frame[dedupe_columns].apply(tuple, axis=1).isin(selected_keys)
-                ]
-            else:
-                fill_candidates = reviewed_frame.drop(sampled_frame.index, errors="ignore")
-            reviewed_fill = evenly_spaced_take(fill_candidates, rows_limit - len(sampled_frame))
-            sampled_frame = pd.concat([sampled_frame, reviewed_fill], ignore_index=True)
-            if dedupe_columns:
-                sampled_frame = sampled_frame.drop_duplicates(subset=dedupe_columns)
-            else:
-                sampled_frame = sampled_frame.drop_duplicates()
-            sampled_frame = sampled_frame.sort_values("Time UTC").reset_index(drop=True)
-        return sampled_frame.iloc[:rows_limit].sort_values("Time UTC").reset_index(drop=True)
-
-    raise ValueError(f"Unsupported sample_strategy: {sample_strategy}")
+    fill_positions = fill_candidates[evenly_spaced_positions(len(fill_candidates), block_limit - len(chosen))]
+    chosen.update(fill_positions.tolist())
+    kept_blocks = [blocks[position] for position in sorted(chosen)]
+    return join_row_blocks(kept_blocks, rows_limit=rows_limit, template=work)
 
 
 def load_full_row_level_frame(
@@ -798,8 +830,11 @@ def add_tabular_baseline_features(
     work["minute_utc"] = work["Time UTC"].dt.minute
     work["day_of_year"] = work["Time UTC"].dt.dayofyear
 
+    # Compare each row with the previous row in the same unbroken stretch of time.
+    # The first row of each stretch gets 0 instead of a change measured across a gap.
+    segment_ids = time_gap_segment_ids(work)
     for column in measurement_columns:
-        work[f"{column} abs_delta"] = work[column].diff().abs().fillna(0.0)
+        work[f"{column} abs_delta"] = work[column].groupby(segment_ids).diff().abs().fillna(0.0)
 
     feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns] + [
         "hour_utc",
@@ -1546,21 +1581,27 @@ def add_temporal_context_features(
     lag_steps: tuple[int, ...] = (1, 3, 5),
     rolling_windows: tuple[int, ...] = (5, 15),
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Add lag and rolling statistics that summarize recent sensor history."""
+    """Add lag and rolling statistics that summarize recent sensor history.
+
+    History restarts after a time gap, so lags and rolling windows never mix
+    rows from two separate stretches of time.
+    """
     work = frame.sort_values("Time UTC").reset_index(drop=True).copy()
+    segment_ids = time_gap_segment_ids(work)
     context_columns: list[str] = []
 
     for column in measurement_columns:
+        values_by_segment = work[column].groupby(segment_ids)
         for lag in lag_steps:
             feature_name = f"{column} lag_{lag}"
-            work[feature_name] = work[column].shift(lag)
+            work[feature_name] = values_by_segment.shift(lag)
             context_columns.append(feature_name)
 
         for window in rolling_windows:
             mean_name = f"{column} roll_mean_{window}"
             std_name = f"{column} roll_std_{window}"
-            work[mean_name] = work[column].rolling(window=window, min_periods=1).mean()
-            work[std_name] = work[column].rolling(window=window, min_periods=2).std()
+            work[mean_name] = values_by_segment.rolling(window=window, min_periods=1).mean().reset_index(level=0, drop=True)
+            work[std_name] = values_by_segment.rolling(window=window, min_periods=2).std().reset_index(level=0, drop=True)
             context_columns.extend([mean_name, std_name])
 
     work[context_columns] = work[context_columns].replace([np.inf, -np.inf], np.nan)
@@ -3120,7 +3161,7 @@ def _frame_to_fixed_windows(
     time_column: str = "Time UTC",
     source_column: str = "source_file",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Turn one split frame into fixed windows without crossing source boundaries."""
+    """Turn one split frame into fixed windows without crossing source boundaries or time gaps."""
 
     required_columns = [*measurement_columns, target_column]
     if time_column in frame.columns:
@@ -3145,14 +3186,17 @@ def _frame_to_fixed_windows(
     for source_frame in grouped_frames:
         if time_column in source_frame.columns:
             source_frame = source_frame.sort_values(time_column).reset_index(drop=True)
-        usable_rows = (len(source_frame) // window_size) * window_size
-        if usable_rows < window_size:
-            continue
-        trimmed = source_frame.iloc[:usable_rows]
-        raw_sequences.append(
-            trimmed[measurement_columns].to_numpy(dtype=np.float32).reshape(-1, window_size, len(measurement_columns))
-        )
-        raw_targets.append(trimmed[target_column].to_numpy().reshape(-1, window_size))
+        # Start fresh windows after each time gap, such as the jump between two kept row blocks.
+        segment_ids = time_gap_segment_ids(source_frame, time_column=time_column, source_column=source_column)
+        for _, segment_frame in source_frame.groupby(segment_ids, sort=False):
+            usable_rows = (len(segment_frame) // window_size) * window_size
+            if usable_rows < window_size:
+                continue
+            trimmed = segment_frame.iloc[:usable_rows]
+            raw_sequences.append(
+                trimmed[measurement_columns].to_numpy(dtype=np.float32).reshape(-1, window_size, len(measurement_columns))
+            )
+            raw_targets.append(trimmed[target_column].to_numpy().reshape(-1, window_size))
 
     if not raw_sequences:
         return (

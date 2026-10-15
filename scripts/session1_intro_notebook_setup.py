@@ -80,6 +80,7 @@ MODELING_EXPORTS = [
     "stage_directory_into_runtime",
     "summarize_split_distributions",
     "summarize_target_by_time_bin",
+    "time_gap_segment_ids",
     "SUPPORTED_SPLIT_STRATEGIES",
 ]
 

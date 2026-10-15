@@ -160,6 +160,7 @@ def load_ml_section_state(
     use_data_fraction_budgets: bool = True,
     split_strategy: str = "global_contiguous",
     train_subset_strategy: str = "time_spread",
+    train_subset_block_rows: int = 256,
     reviewed_file_selection_mode: str = "spread",
     reviewed_file_limit: int | None = None,
     reviewed_model_row_limit: int | None = None,
@@ -205,7 +206,10 @@ def load_ml_section_state(
     k-means, CNN, and Transformer sections.
 
     Most workshop runs only need to adjust the dataset preset,
-    ``data_fraction``, split strategy, and train-subset strategy.
+    ``data_fraction``, split strategy, and train-subset strategy. The train
+    subset keeps whole blocks of ``train_subset_block_rows`` consecutive rows,
+    so neighbouring training rows are as far apart in time as validation and
+    test rows.
     ``data_fraction`` controls the reviewed modelling row cap as a fraction of
     the actual usable reviewed rows, plus the train-only subset cap. For
     example, ``0.1`` gives a quick 10% reviewed-row run and ``0.9`` gives a
@@ -231,6 +235,8 @@ def load_ml_section_state(
         raise ValueError(f"Unknown dataset_profile_id={dataset_profile_id!r}. Choose one of: {supported}.")
     if not 0 < data_fraction <= 1:
         raise ValueError("data_fraction must be in the interval (0, 1].")
+    if train_subset_block_rows <= 0:
+        raise ValueError("train_subset_block_rows must be positive.")
     repo_root = _find_notebook_root(notebook_root)
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
@@ -511,6 +517,7 @@ def load_ml_section_state(
         issue_labels=model_issue_labels,
         issue_rows=issue_rows_per_file,
         balanced_issue_share=balanced_reviewed_target_issue_share,
+        block_rows=train_subset_block_rows,
     )
 
     is_custom_dataset = dataset_profile_id == "custom" or any(
@@ -578,6 +585,7 @@ def load_ml_section_state(
         "test_rows": len(test_df),
         "train_subset_strategy": train_subset_strategy,
         "train_subset_max_rows": train_subset_max_rows,
+        "train_subset_block_rows": train_subset_block_rows,
         "issue_rows_per_file": issue_rows_per_file,
         "balanced_reviewed_target_issue_share": balanced_reviewed_target_issue_share,
         "train_subset_rows": len(train_df),
@@ -683,6 +691,7 @@ def load_ml_section_state(
             "window_df": window_df,
             "TRAIN_SUBSET_STRATEGY": train_subset_strategy,
             "TRAIN_SUBSET_MAX_ROWS": train_subset_max_rows,
+            "TRAIN_SUBSET_BLOCK_ROWS": train_subset_block_rows,
             "ISSUE_ROWS_PER_FILE": issue_rows_per_file,
             "BALANCED_REVIEWED_TARGET_ISSUE_SHARE": balanced_reviewed_target_issue_share,
             "train_df": train_df,
