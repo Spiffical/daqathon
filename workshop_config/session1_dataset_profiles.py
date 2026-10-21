@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .session1_defaults import CTD_MEASUREMENT_COLUMNS
-
 # Dataset profile property guide
 #
 # Each entry in WORKSHOP_DATASET_PROFILES describes one pre-loaded workshop
@@ -80,6 +78,8 @@ CUSTOM_DATASET_TEMPLATE: dict[str, Any] = {
     "cache_read_sample_rows": None,
     "auto_build_missing_cache": False,
     "default_prep_sample_rows": None,
+    # Short "what to expect" notes printed by the ML notebook's score explanations.
+    "teaching_notes": [],
 }
 
 WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
@@ -93,7 +93,20 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "good_labels": [1],
         "issue_labels": [3, 4, 9],
         "flag_example_classes": [1, 3, 4, 9],
-        "measurement_columns": CTD_MEASUREMENT_COLUMNS,
+        # Depth (m) is left out: it nearly duplicates Pressure (decibar), and the
+        # March 2026 deployment file is missing it on 92% of rows. The CNN and
+        # Transformer skip rows with missing values, so keeping it would cost
+        # them most of the last ~10 days of the test period.
+        "measurement_columns": [
+            "Conductivity (S/m)",
+            "Density (kg/m3)",
+            "Practical Salinity (psu)",
+            "Pressure (decibar)",
+            "Sigma-t (kg/m3)",
+            "Sigma-theta (0 dbar) (kg/m3)",
+            "Sound Speed (m/s)",
+            "Temperature (C)",
+        ],
         "optional_qc_columns": ["Temperature QC Flag"],
         "plot_measurement_column": "Conductivity (S/m)",
         "plot_secondary_column": "Temperature (C)",
@@ -105,6 +118,10 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
+        "teaching_notes": [
+            "Flags 3 (probably bad) and 4 (bad) look alike in this dataset: mostly conductivity dropouts while temperature stays steady, plus single-point spikes. Flag 3 covers only six episodes in the year, so models rarely learn to tell it apart from flag 4.",
+            "Flag 9 marks missing conductivity values, so it is easy to learn.",
+        ],
     },
     "fluorometer_turbidity": {
         "label": "Fluorometer turbidity QC",
@@ -143,6 +160,9 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
+        "teaching_notes": [
+            "Flag 4 is a range check: it marks turbidity readings below 0 NTU. The Random Forest can learn that threshold directly; the CNN and Transformer get an extra 0/1 input channel that marks readings below 0 NTU, because scaling the inputs hides such a small gap.",
+        ],
     },
     "oxygen": {
         "label": "Oxygen QC",
@@ -154,11 +174,16 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "good_labels": [1],
         "issue_labels": [3, 4, 9],
         "flag_example_classes": [1, 2, 3, 4, 9],
+        # Corrected oxygen is computed from salinity, and its QC flag 4 follows the CTD's
+        # salinity flag 4 on almost every row. Practical Salinity and Conductivity give the
+        # models the inputs behind that flag.
         "measurement_columns": [
             "Oxygen Concentration Corrected (ml/l)",
             "Oxygen Concentration Uncorrected (ml/l)",
             "Temperature (C)",
             "Pressure (decibar)",
+            "Practical Salinity (psu)",
+            "Conductivity (S/m)",
         ],
         "optional_qc_columns": ["Temperature QC Flag"],
         "plot_measurement_column": "Oxygen Concentration Corrected (ml/l)",
@@ -171,6 +196,10 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "cache_read_sample_rows": None,
         "auto_build_missing_cache": True,
         "default_prep_sample_rows": None,
+        "teaching_notes": [
+            "Corrected oxygen is computed from salinity, so whenever the CTD's salinity is flagged bad (4), corrected oxygen is flagged 4 too. That is why Practical Salinity and Conductivity are in this preset's measurement columns: without them, flag 4 is hard to learn.",
+            "One flag-4 episode (July 2025) has normal-looking salinity, conductivity, and oxygen values, so nothing in these inputs separates it from good data. The episode_aware split puts it in the test set, where the Random Forest and the window-level CNN and Transformer score close to 0 on flag 4.",
+        ],
     },
     "conductivity_plugs": {
         "label": "Conductivity plugs",
@@ -209,6 +238,11 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "cache_read_sample_rows": 250_000,
         "auto_build_missing_cache": False,
         "default_prep_sample_rows": 500_000,
+        "teaching_notes": [
+            "Label 1 (bad plug) shows up as long conductivity dropouts and spikes, and it is the most learnable issue.",
+            "Label 3 (non-conductivity failure) marks failures in other instruments, often single points with no visible change in these inputs, so expect it to be missed. Label 2 is very rare, so its scores are unreliable.",
+            "Label 4 marks missing data.",
+        ],
     },
 }
 

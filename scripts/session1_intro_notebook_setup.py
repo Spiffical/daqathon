@@ -54,6 +54,7 @@ MODELING_EXPORTS = [
     "fit_kmeans",
     "fit_random_forest",
     "infer_interval_origin",
+    "keep_modelling_rows",
     "load_full_row_level_frame",
     "load_rows_for_time_range",
     "load_selected_row_level_frame",

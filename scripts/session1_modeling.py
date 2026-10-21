@@ -543,11 +543,14 @@ def sample_frame_by_strategy(
     - ``issue_focused``: keep evenly spaced blocks that contain issue rows, enough
       to hold about ``issue_rows`` issue rows, then fill the rest of the budget
       with evenly spaced blocks.
-    - ``balanced_reviewed``: keep the blocks with the most issue rows until they
-      hold about ``balanced_issue_share`` of the budget as issue rows, then fill
-      the rest with evenly spaced blocks whose rows all have good labels. The
-      share is a target, not a guarantee: issue rows sit inside blocks with good
-      rows, and rare issues can run out first.
+    - ``balanced_reviewed``: split an issue budget of about
+      ``balanced_issue_share`` of the rows equally between the issue labels
+      present, keep evenly spaced blocks that contain each label until its share
+      is reached, then fill the rest with evenly spaced blocks whose rows all
+      have good labels. Spreading each label's blocks through time stops one
+      long episode from filling the whole budget. The share is a target, not a
+      guarantee: issue rows sit inside blocks with good rows, and rare issues
+      can run out first.
     - ``full_train``: keep the complete input frame, matching the strategy of the
       same name in the data-preparation notebook.
 
@@ -585,12 +588,21 @@ def sample_frame_by_strategy(
         if not 0 < balanced_issue_share < 1:
             raise ValueError("balanced_issue_share must be in the open interval (0, 1)")
         issue_target = int(round(rows_limit * balanced_issue_share))
-        # Most issue-dense blocks first, until they hold about issue_target issue rows.
-        densest_positions = issue_positions[np.argsort(-issue_counts[issue_positions], kind="stable")]
-        cumulative_issue_rows = np.cumsum(issue_counts[densest_positions])
-        issue_block_count = int(np.searchsorted(cumulative_issue_rows, issue_target)) + 1 if issue_target > 0 else 0
-        issue_block_count = min(issue_block_count, len(densest_positions), block_limit)
-        chosen = set(densest_positions[:issue_block_count].tolist())
+        # Give every issue label present an equal part of issue_target. Each label keeps
+        # evenly spaced blocks that contain it, so its examples come from across the time range.
+        block_labels = [pd.to_numeric(block[target_flag], errors="coerce") for block in blocks]
+        present_issue_labels = [
+            label for label in normalized_issue_labels if any((labels == label).any() for labels in block_labels)
+        ]
+        chosen = set()
+        for label in present_issue_labels if issue_target > 0 else []:
+            label_counts = np.array([int((labels == label).sum()) for labels in block_labels])
+            label_positions = np.flatnonzero(label_counts > 0)
+            label_block_count = int(np.ceil(issue_target / len(present_issue_labels) / label_counts[label_positions].mean()))
+            chosen.update(label_positions[evenly_spaced_positions(len(label_positions), label_block_count)].tolist())
+        if len(chosen) > block_limit:
+            chosen_positions = np.array(sorted(chosen))
+            chosen = set(chosen_positions[evenly_spaced_positions(len(chosen_positions), block_limit)].tolist())
         normalized_good_labels = normalize_label_list(good_labels, DEFAULT_GOOD_LABELS)
         good_only = np.array(
             [bool(pd.to_numeric(block[target_flag], errors="coerce").isin(normalized_good_labels).all()) for block in blocks]
@@ -818,17 +830,24 @@ def build_reviewed_target_frame(
     return work, active_labels
 
 
+CLOCK_FEATURE_COLUMNS = ["hour_utc", "minute_utc", "day_of_year"]
+
+
 def add_tabular_baseline_features(
     frame: pd.DataFrame,
     *,
     measurement_columns: list[str],
+    include_clock_features: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Add the baseline RF-style tabular features to a reviewed frame."""
+    """Add the baseline RF-style tabular features to a reviewed frame.
+
+    ``include_clock_features`` adds the UTC hour, minute, and day of year. They
+    are off by default: the workshop datasets cover about one year, so a model
+    can use ``day_of_year`` to memorise when problems happened instead of
+    learning what they look like.
+    """
 
     work = frame.copy()
-    work["hour_utc"] = work["Time UTC"].dt.hour
-    work["minute_utc"] = work["Time UTC"].dt.minute
-    work["day_of_year"] = work["Time UTC"].dt.dayofyear
 
     # Compare each row with the previous row in the same unbroken stretch of time.
     # The first row of each stretch gets 0 instead of a change measured across a gap.
@@ -836,11 +855,12 @@ def add_tabular_baseline_features(
     for column in measurement_columns:
         work[f"{column} abs_delta"] = work[column].groupby(segment_ids).diff().abs().fillna(0.0)
 
-    feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns] + [
-        "hour_utc",
-        "minute_utc",
-        "day_of_year",
-    ]
+    feature_columns = measurement_columns + [f"{column} abs_delta" for column in measurement_columns]
+    if include_clock_features:
+        work["hour_utc"] = work["Time UTC"].dt.hour
+        work["minute_utc"] = work["Time UTC"].dt.minute
+        work["day_of_year"] = work["Time UTC"].dt.dayofyear
+        feature_columns = feature_columns + CLOCK_FEATURE_COLUMNS
     return work, feature_columns
 
 
@@ -1546,8 +1566,11 @@ def build_model_frame(
     good_labels: list[int] | tuple[int, ...] | None = None,
     issue_labels: list[int] | tuple[int, ...] | None = None,
     model_row_limit: int | None = None,
+    include_clock_features: bool = False,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     """Create the baseline tabular feature frame used by the supervised models.
+
+    ``include_clock_features`` is passed to ``add_tabular_baseline_features``.
 
     The older notebook flow passed the selected sensor columns through a
     `columns=` keyword, while the newer generalized notebooks use
@@ -1570,6 +1593,7 @@ def build_model_frame(
     model_df, feature_columns = add_tabular_baseline_features(
         model_df,
         measurement_columns=measurement_columns,
+        include_clock_features=include_clock_features,
     )
     return model_df, feature_columns, active_labels
 
@@ -1925,6 +1949,39 @@ def load_rows_for_time_range(
         return pd.DataFrame()
 
     return pd.concat(frames, ignore_index=True).sort_values("Time UTC").reset_index(drop=True)
+
+
+def keep_modelling_rows(
+    rows: pd.DataFrame,
+    modelling_rows: pd.DataFrame,
+    *,
+    time_column: str = "Time UTC",
+    source_column: str = "source_file",
+) -> pd.DataFrame:
+    """Keep only the rows that also appear in ``modelling_rows``.
+
+    ``DATA_FRACTION`` keeps evenly spaced reviewed rows before the
+    train/validation/test split, so at 0.1 the models learn from every 10th
+    reading. Rows loaded for a date range contain every reading. Matching on
+    source file and timestamp gives a date-range demo the same rows, and so the
+    same time between neighbouring rows, that the models were trained and
+    tested on. With ``DATA_FRACTION = 1.0`` every reviewed row is kept.
+    """
+    if rows.empty:
+        return rows.reset_index(drop=True)
+
+    def row_keys(frame: pd.DataFrame) -> pd.MultiIndex:
+        times = pd.to_datetime(frame[time_column], utc=True).astype("datetime64[ns, UTC]").astype("int64")
+        return pd.MultiIndex.from_arrays([frame[source_column].astype(str).to_numpy(), times.to_numpy()])
+
+    # Compare only against modelling rows inside the loaded time span.
+    row_times = pd.to_datetime(rows[time_column], utc=True)
+    modelling_times = pd.to_datetime(modelling_rows[time_column], utc=True)
+    nearby_modelling_rows = modelling_rows[
+        (modelling_times >= row_times.min()) & (modelling_times <= row_times.max())
+    ]
+    keep = row_keys(rows).isin(row_keys(nearby_modelling_rows))
+    return rows[keep].reset_index(drop=True)
 
 
 def select_time_range(
@@ -2296,19 +2353,31 @@ def compute_interval_classification_metrics(
     average: str,
     target_names: list[str] | None = None,
 ) -> dict[str, object]:
-    """Compute the text report, normalized confusion matrix, and F1 for a slice."""
+    """Compute the text report, normalized confusion matrix, and F1 for a slice.
+
+    A short time range often contains only one or two of the model's labels.
+    The F1 score and the text report therefore average over the labels that
+    occur in the range, as true or predicted labels, so a range that holds only
+    flag 4 can still score 1.0. The confusion matrix keeps every label.
+    """
     label_names = target_names or [str(label) for label in labels]
+    seen_labels = set(pd.Series(y_true).astype(int)) | set(pd.Series(y_pred).astype(int))
+    present_positions = [position for position, label in enumerate(labels) if int(label) in seen_labels]
+    if not present_positions:
+        present_positions = list(range(len(labels)))
+    present_labels = [labels[position] for position in present_positions]
+    present_names = [label_names[position] for position in present_positions]
     if average == "binary":
         interval_f1 = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
     else:
-        interval_f1 = float(f1_score(y_true, y_pred, labels=labels, average=average, zero_division=0))
+        interval_f1 = float(f1_score(y_true, y_pred, labels=present_labels, average=average, zero_division=0))
     return {
         "f1": interval_f1,
         "report_text": classification_report(
             y_true,
             y_pred,
-            labels=labels,
-            target_names=label_names,
+            labels=present_labels,
+            target_names=present_names,
             zero_division=0,
         ),
         "confusion_matrix": confusion_matrix(

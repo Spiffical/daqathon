@@ -33,6 +33,7 @@ from .session1_modeling import (
     compute_interval_classification_metrics,
     compute_split_share_gap,
     infer_interval_origin,
+    keep_modelling_rows,
     load_full_row_level_frame,
     load_rows_for_time_range,
     merge_adjacent_intervals,
@@ -142,7 +143,20 @@ def stage_session1_inputs(
                 progress_label=f"Staging raw CSV files for {dataset_label} to runtime storage",
             )
 
-    if use_runtime_cache_for_reads:
+    # Only stage a cache bundle that already exists. A custom cache that has not
+    # been built yet is created later in read_cache_path, so it must stay there
+    # rather than in runtime storage, which is deleted when the job ends.
+    cache_bundle_exists = resolve_cache_bundle_paths(read_cache_path, cache_stem=cache_bundle_name).metadata_path.exists()
+    stage_cache = use_runtime_cache_for_reads and cache_bundle_exists
+    if use_runtime_cache_for_reads and not cache_bundle_exists:
+        cache_stage_result = {
+            "staged": False,
+            "reason": (
+                f"no '{cache_bundle_name}' cache exists in {read_cache_path} yet, so there is nothing to stage; "
+                "a cache built later in this notebook is written to that folder"
+            ),
+        }
+    elif stage_cache:
         cache_stage_result = stage_cache_into_runtime(
             persistent_cache_dir=read_cache_path,
             runtime_cache_dir=runtime_cache_path,
@@ -157,7 +171,7 @@ def stage_session1_inputs(
         else read_raw_path
     )
     active_raw_csv_paths = [str(path) for path in staged_csv_paths] if staged_csv_paths else [str(path) for path in explicit_csv_paths]
-    cache_candidates = [runtime_cache_path, read_cache_path] if use_runtime_cache_for_reads else [read_cache_path]
+    cache_candidates = [runtime_cache_path, read_cache_path] if stage_cache else [read_cache_path]
     active_cache_paths = choose_cache_bundle_paths(cache_candidates, cache_stem=cache_bundle_name)
     notebook_values = {
         "RAW_DATA_DIR": str(active_raw_data_dir),
@@ -292,12 +306,14 @@ def derive_fractional_row_limit(
 
 
 def select_part_paths(part_paths: list[Path], limit: int | None, mode: str) -> list[Path]:
-    """Choose parquet or CSV files either sequentially or spread through time."""
+    """Choose parquet or CSV files: the first, the last, spread through time, or all."""
 
-    if limit is None or limit >= len(part_paths):
+    if mode == "all" or limit is None or limit >= len(part_paths):
         return part_paths
     if mode == "first":
         return part_paths[:limit]
+    if mode == "last":
+        return part_paths[-limit:]
     if mode == "spread":
         indices = np.linspace(0, len(part_paths) - 1, num=limit, dtype=int)
         selected: list[Path] = []
@@ -1687,12 +1703,15 @@ def show_cnn_interval_demo(
     metadata: dict[str, object] | None = None,
     row_cache_dir: str | Path | None = None,
     row_use_columns: list[str] | tuple[str, ...] | None = None,
+    modelling_rows: pd.DataFrame | None = None,
     train_df: pd.DataFrame | None = None,
     valid_df: pd.DataFrame | None = None,
     test_df: pd.DataFrame | None = None,
     target_flag: str | None = None,
     measurement_columns: list[str] | tuple[str, ...] | None = None,
     task_mode: str | None = None,
+    good_labels: list[int] | tuple[int, ...] | None = None,
+    issue_labels: list[int] | tuple[int, ...] | None = None,
     class_labels: list[int] | tuple[int, ...] | np.ndarray | None = None,
     channel_mean: object | None = None,
     channel_std: object | None = None,
@@ -1716,6 +1735,11 @@ def show_cnn_interval_demo(
     - ``output_mode="window"`` predicts one label for each complete window.
     - ``output_mode="per_timestep"`` predicts one label for every timestamp
       inside each complete window.
+
+    Pass ``modelling_rows`` (``ML_STATE['reviewed_model_df']``) to keep only
+    the rows that ``DATA_FRACTION`` kept for training and testing, so each
+    window covers the same length of time as the training windows. ``None``
+    uses every row in the range.
 
     Pass ``range_selection`` (the result of ``select_time_range``) when the
     range was already chosen in an earlier cell. Otherwise the helper chooses
@@ -1781,6 +1805,8 @@ def show_cnn_interval_demo(
         end=cnn_range_selection["end"],
         columns=list(row_use_columns),
     )
+    if modelling_rows is not None:
+        cnn_interval_rows = keep_modelling_rows(cnn_interval_rows, modelling_rows)
     if cnn_interval_rows.empty:
         print("No row-level data was found in the requested CNN range.")
         return {
@@ -1795,6 +1821,8 @@ def show_cnn_interval_demo(
         target_flag=target_flag,
         measurement_columns=list(measurement_columns),
         task_mode=task_mode,
+        good_labels=good_labels,
+        issue_labels=issue_labels,
         model_row_limit=None,
     )
     cnn_interval_model_df = cnn_interval_model_df[
