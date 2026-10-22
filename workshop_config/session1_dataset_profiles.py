@@ -239,9 +239,11 @@ WORKSHOP_DATASET_PROFILES: dict[str, dict[str, Any]] = {
         "auto_build_missing_cache": False,
         "default_prep_sample_rows": 500_000,
         "teaching_notes": [
-            "Label 1 (bad plug) shows up as long conductivity dropouts and spikes, and it is the most learnable issue.",
-            "Label 3 (non-conductivity failure) marks failures in other instruments, often single points with no visible change in these inputs, so expect it to be missed. Label 2 is very rare, so its scores are unreliable.",
-            "Label 4 marks missing data.",
+            "Labels 1 and 2 are exactly ONC's conductivity QC flag 4 (a blocked intake versus other conductivity problems). Label 3 is mostly the oxygen sensor's QC flag 4 while conductivity is fine, and label 4 rows have every input missing.",
+            "The data come from two deployments whose plugs look different: in June 2022 conductivity dropped sharply, while the January 2023 plug lowered it only slightly. The default split trains mostly on the first deployment and validates and tests on the second, so it asks the model to recognise a kind of plug it has never seen. Expect low scores that change a lot with the training rows and the seed.",
+            "In early March 2023 colder, oxygen-rich water reached the site and lowered conductivity. It is labelled good, but models often mistake it for a plug: during a real plug salinity drops sharply, during this event it barely changes.",
+            "To train on both deployments' plugs, use `SPLIT_STRATEGY = \"interleaved_blocks\"`. `TRAIN_SUBSET_STRATEGY = \"balanced_reviewed\"` then helps the Random Forest and lets it catch the missing-data rows, but makes the CNN and Transformer worse, because their loss already gives rare labels extra weight.",
+            "Label 2 is very rare and mostly single rows, so its scores are unreliable.",
         ],
     },
 }
