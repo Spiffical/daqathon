@@ -75,7 +75,15 @@ FIR:
 https://jupyterhub.fir.alliancecan.ca/
 ```
 
-Start your JupyterHub environment on the cluster you are using.
+Start your JupyterHub environment on the cluster you are using. On the server options form, change these fields:
+
+| Field | Choose |
+|---|---|
+| Memory (MB) | `24000`. The form's default (2375 MB on Narval) is far too small; see [Memory Requirements](#memory-requirements). |
+| Number of cores | `4` |
+| Time (hours) | `2`–`3` |
+| GPU | Narval: an A100 slice such as `3g.20gb`. FIR: an H100 slice such as `2g.20gb`. The data-preparation notebook doesn't need a GPU. |
+| User interface | JupyterLab |
 
 ### 5. Open the notebooks from your cloned repo
 
@@ -86,6 +94,28 @@ In the JupyterHub file browser:
 - select the shared `Daqathon ML` kernel when prompted
 
 Launch the notebooks from inside the cloned repo so the helper imports work correctly.
+
+## Memory Requirements
+
+Ask for **24 GB (24000 MB)** when you start JupyterHub. The notebooks load up to a year of sensor data into memory, so they need far more than the form's default.
+
+At the default `DATA_FRACTION = 0.1`, one notebook running on its own reached these peaks in the test runs:
+
+| Notebook | Narval | FIR |
+|---|---|---|
+| Data preparation | up to 14.8 GB | 5.8–6.3 GB |
+| Machine learning | 6.5–13.8 GB | 3.8–4.1 GB |
+| Advanced | 9.1–13.8 GB | 6.9–7.5 GB |
+
+Each range covers the four dataset presets. Plan for the Narval figures on either cluster.
+
+Memory grows with the amount of data you keep:
+
+- **`DATA_FRACTION`.** In the machine-learning notebook with the CTD preset on Narval, the peak was 11.3 GB at `0.1`, 13.2 GB at `0.5` and 17.3 GB at `0.9`. `1.0` also removes the row caps and was not measured, so ask for more than 24 GB before you try it.
+- **Larger row caps.** Raising caps such as `RF_TRAIN_BASE_ROWS` keeps more rows, so it uses more memory too.
+- **Several notebooks at once.** Each open notebook keeps its own kernel, with its data, in memory until that kernel shuts down, so two notebooks running in one 24 GB server can run out. Before you start another notebook, shut down the kernel of the one you finished (**Kernel → Shut Down Kernel**, or the **Running Terminals and Kernels** panel in the left sidebar).
+
+**If you run out of memory**, the kernel is stopped: JupyterLab reports that the kernel died or is restarting, and every variable is gone. Shut down kernels you don't need, lower `DATA_FRACTION`, or restart your server with more memory (**File → Hub Control Panel → Stop My Server**, then start it again). Then rerun the notebook from the top.
 
 ## What Lives Where
 
