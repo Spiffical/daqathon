@@ -43,6 +43,7 @@ from .session1_modeling import (
     report_average,
     reviewed_label_mask,
     resolve_cache_bundle_paths,
+    select_flag_examples,
     select_time_range,
     split_frame_by_strategy,
     stage_cache_into_runtime,
@@ -160,9 +161,10 @@ def stage_session1_inputs(
         cache_stage_result = stage_cache_into_runtime(
             persistent_cache_dir=read_cache_path,
             runtime_cache_dir=runtime_cache_path,
+            cache_stem=cache_bundle_name,
             force=force,
             show_progress=True,
-            progress_label="Staging parquet cache to runtime storage",
+            progress_label=f"Staging parquet cache for {dataset_label} to runtime storage",
         )
 
     active_raw_data_dir = (
@@ -466,6 +468,84 @@ def load_raw_flag_context_sample(
     if duplicate_columns:
         sample = sample.drop_duplicates(subset=duplicate_columns).reset_index(drop=True)
     return sample
+
+
+def _iter_flag_example_sources(
+    *,
+    row_cache_dir: str | Path | None,
+    csv_paths: list[Path] | None,
+    use_columns: list[str],
+    required_columns: set[str],
+):
+    """Yield one dataframe per cache part, or per raw CSV file when there is no cache."""
+
+    part_paths = sorted(Path(row_cache_dir).glob("*.parquet")) if row_cache_dir and Path(row_cache_dir).is_dir() else []
+    cache_columns = set(pq.read_schema(part_paths[0]).names) if part_paths else set()
+    if part_paths and required_columns <= cache_columns:
+        read_columns = [column for column in [*use_columns, "source_file"] if column in cache_columns]
+        for part_path in part_paths:
+            frame = pq.read_table(part_path, columns=read_columns).to_pandas()
+            if "source_file" not in frame.columns:
+                frame["source_file"] = part_path.name
+            yield frame
+        return
+
+    for csv_path in csv_paths or []:
+        header_line_number, csv_columns = locate_header(csv_path)
+        read_columns = [column for column in use_columns if column in csv_columns]
+        if not required_columns <= set(read_columns):
+            continue
+        frame = pd.read_csv(
+            csv_path,
+            header=None,
+            names=csv_columns,
+            skiprows=header_line_number,
+            usecols=read_columns,
+            low_memory=False,
+        )
+        frame["Time UTC"] = pd.to_datetime(frame["Time UTC"], utc=True, errors="coerce", format="ISO8601")
+        for column in [column for column in read_columns if column != "Time UTC"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["Time UTC"])
+        frame["source_file"] = Path(csv_path).name
+        yield frame
+
+
+def load_flag_example_context(
+    *,
+    target_flag: str,
+    classes: list[int] | tuple[int, ...],
+    good_labels: list[int] | tuple[int, ...],
+    measurement_column: str,
+    points_per_panel: int,
+    columns: list[str] | None = None,
+    avoid_context_labels: list[int] | tuple[int, ...] | None = None,
+    row_cache_dir: str | Path | None = None,
+    csv_paths: list[Path] | None = None,
+) -> pd.DataFrame:
+    """Find the clearest example of each label across a whole dataset.
+
+    Every row-level part of the prepared parquet cache is searched when the cache
+    exists; otherwise the raw ``csv_paths`` are read. The examples are chosen by
+    ``select_flag_examples`` and returned ready for ``plot_flag_examples``.
+    """
+
+    use_columns = list(dict.fromkeys(["Time UTC", target_flag, measurement_column, *(columns or [])]))
+    use_columns = [column for column in use_columns if column]
+    return select_flag_examples(
+        _iter_flag_example_sources(
+            row_cache_dir=row_cache_dir,
+            csv_paths=csv_paths,
+            use_columns=use_columns,
+            required_columns={"Time UTC", target_flag, measurement_column},
+        ),
+        target_flag=target_flag,
+        classes=classes,
+        good_labels=good_labels,
+        measurement_column=measurement_column,
+        points_per_panel=points_per_panel,
+        avoid_context_labels=avoid_context_labels,
+    )
 
 
 def directory_size_bytes(path: Path, pattern: str) -> int:

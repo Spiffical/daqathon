@@ -9,6 +9,7 @@ import math
 import pickle
 import shutil
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -216,6 +217,7 @@ def stage_directory_into_runtime(
     source_dir: str | Path,
     runtime_dir: str | Path,
     *,
+    include: list[str] | None = None,
     force: bool = False,
     show_progress: bool = False,
     progress_label: str = "Staging files",
@@ -225,6 +227,9 @@ def stage_directory_into_runtime(
     This is used for Narval/FIR notebook runs where shared project storage is the
     long-lived source of truth, but node-local job storage such as
     ``$SLURM_TMPDIR`` is much faster for interactive work.
+
+    ``include`` limits the copy to these names directly inside ``source_dir``
+    (files, or folders with everything in them). ``None`` copies everything.
     """
     source_dir = Path(source_dir).expanduser().resolve()
     runtime_dir = Path(runtime_dir).expanduser().resolve()
@@ -234,13 +239,25 @@ def stage_directory_into_runtime(
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
+    if include is None:
+        source_paths = list(source_dir.rglob("*"))
+    else:
+        source_paths = []
+        for name in include:
+            top_path = source_dir / name
+            if not top_path.exists():
+                continue
+            source_paths.append(top_path)
+            if top_path.is_dir():
+                source_paths.extend(top_path.rglob("*"))
+
     files_to_copy: list[tuple[Path, Path]] = []
     total_bytes = 0
     copied_files = 0
     copied_bytes = 0
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    for source_path in source_dir.rglob("*"):
+    for source_path in source_paths:
         relative_path = source_path.relative_to(source_dir)
         destination_path = runtime_dir / relative_path
         if source_path.is_dir():
@@ -290,20 +307,36 @@ def stage_cache_into_runtime(
     persistent_cache_dir: str | Path,
     runtime_cache_dir: str | Path,
     *,
+    cache_stem: str | None = None,
     force: bool = False,
     show_progress: bool = False,
     progress_label: str = "Staging cache",
 ) -> dict[str, object]:
-    """Copy a read-only prepared cache into a writable runtime directory."""
+    """Copy a read-only prepared cache into a writable runtime directory.
+
+    With ``cache_stem``, only that cache bundle is copied (its row-level folder,
+    windowed features and metadata), not every dataset's bundle in the folder.
+    """
+    include = None
+    if cache_stem is not None:
+        bundle_paths = resolve_cache_bundle_paths(persistent_cache_dir, cache_stem=cache_stem)
+        include = [
+            bundle_paths.row_level_dir.name,
+            bundle_paths.window_cache_path.name,
+            bundle_paths.metadata_path.name,
+        ]
     stage_result = stage_directory_into_runtime(
         source_dir=persistent_cache_dir,
         runtime_dir=runtime_cache_dir,
+        include=include,
         force=force,
         show_progress=show_progress,
         progress_label=progress_label,
     )
     if stage_result.get("staged"):
         stage_result["runtime_cache_dir"] = str(Path(runtime_cache_dir).expanduser().resolve())
+        if cache_stem is not None:
+            stage_result["cache_stem"] = bundle_paths.stem
     return stage_result
 
 
@@ -2602,6 +2635,251 @@ def predict_sequence_label_cnn(
     return np.concatenate(predictions, axis=0) if predictions else np.empty((0, 0), dtype=int)
 
 
+def find_flag_example_windows(
+    flags: np.ndarray,
+    values: np.ndarray,
+    *,
+    flag: int,
+    good_labels: set[int],
+    avoid_labels: set[int],
+    points_per_panel: int,
+    max_spans: int = 200,
+) -> list[dict[str, object]]:
+    """Score every stretch of ``flag`` in one time-ordered block of rows.
+
+    Each candidate is a plotting window around one stretch. An issue label
+    scores highly when its values sit outside the range of the good values on
+    either side (or, for a missing-data label, when it leaves a gap in the
+    line), when the stretch is long enough to see as a region rather than a
+    single point, and when good data surrounds it. A good label scores highly
+    for a window that is entirely good.
+    A stretch gets a window about 20 times its length (at least 600 rows and at
+    most ``points_per_panel`` rows), centred on it; a stretch longer than a
+    third of ``points_per_panel`` gets the same length of data on each side.
+    """
+    flags = np.asarray(flags, dtype=int)
+    values = np.asarray(values, dtype=float)
+    row_count = len(flags)
+    if row_count == 0:
+        return []
+    points_per_panel = max(int(points_per_panel), 3)
+    change_rows = np.flatnonzero(np.diff(flags) != 0) + 1
+    run_starts = np.r_[0, change_rows]
+    run_stops = np.r_[change_rows, row_count]
+    matching_runs = np.flatnonzero(flags[run_starts] == flag)
+    if len(matching_runs) == 0:
+        return []
+    # Checking the longest stretches first keeps the search quick on labels with
+    # many one-row stretches; short stretches rarely make the clearest example.
+    run_lengths = run_stops[matching_runs] - run_starts[matching_runs]
+    matching_runs = matching_runs[np.argsort(-run_lengths, kind="stable")][:max_spans]
+
+    good_rows = np.isin(flags, list(good_labels)) & np.isfinite(values)
+    present_rows = np.isfinite(values)
+    other_avoid_labels = list(set(avoid_labels) - {flag})
+    candidates = []
+    for run in matching_runs:
+        span_start = int(run_starts[run])
+        span_stop = int(run_stops[run])
+        span_rows = span_stop - span_start
+        if flag in good_labels or span_rows <= points_per_panel // 3:
+            window_rows = points_per_panel if flag in good_labels else min(max(span_rows * 20, 600), points_per_panel)
+            middle = (span_start + span_stop) // 2
+            start = max(middle - window_rows // 2, 0)
+            stop = min(start + window_rows, row_count)
+            start = max(stop - window_rows, 0)
+        else:
+            start = max(span_start - span_rows, 0)
+            stop = min(span_stop + span_rows, row_count)
+        avoid_share = float(np.isin(flags[start:stop], other_avoid_labels).mean()) if other_avoid_labels else 0.0
+
+        if flag in good_labels:
+            good_share = float((flags[start:stop] == flag).mean())
+            candidates.append(
+                {
+                    "start": start,
+                    "stop": stop,
+                    "span_start": start,
+                    "span_end": stop - 1,
+                    "kind": "good",
+                    "outside_share": np.nan,
+                    "score": good_share * float(present_rows[start:stop].mean()) * (1.0 - avoid_share),
+                }
+            )
+            continue
+
+        before = slice(start, span_start)
+        after = slice(span_stop, stop)
+        # A side counts fully once at least half of its rows are good.
+        side_scores = [
+            min(float(good_rows[side].mean()) / 0.5, 1.0) if side.stop > side.start else 0.0
+            for side in (before, after)
+        ]
+        context_score = sum(side_scores) / 2
+        # A stretch counts as long enough to see as a region once it has 50 rows.
+        length_score = min(span_rows / 50, 1.0)
+
+        flagged_values = values[span_start:span_stop]
+        flagged_values = flagged_values[np.isfinite(flagged_values)]
+        outside_share = np.nan
+        if len(flagged_values) < 0.5 * span_rows:
+            kind = "gap"
+            visibility = 2.0
+        else:
+            kind = "values"
+            visibility = 0.0
+            context_values = np.r_[values[before][good_rows[before]], values[after][good_rows[after]]]
+            if len(context_values) >= 20:
+                low, high = np.quantile(context_values, [0.01, 0.99])
+                outside_share = float(((flagged_values < low) | (flagged_values > high)).mean())
+                centre = float(np.median(context_values))
+                spread = max(1.4826 * float(np.median(np.abs(context_values - centre))), (high - low) / 4, 1e-12)
+                distance = float(np.median(np.abs(flagged_values - centre))) / spread
+                visibility = outside_share * min(1.0 + np.log10(1.0 + distance), 2.0)
+
+        candidates.append(
+            {
+                "start": start,
+                "stop": stop,
+                "span_start": span_start,
+                "span_end": span_stop - 1,
+                "kind": kind,
+                "outside_share": outside_share,
+                "score": visibility
+                * (0.25 + 0.75 * length_score)
+                * (0.25 + 0.75 * context_score)
+                * (1.0 - avoid_share)
+                + 1e-3 * length_score,
+            }
+        )
+    return candidates
+
+
+def _contiguous_example_blocks(frame: pd.DataFrame) -> list[pd.DataFrame]:
+    """Split rows into blocks that are contiguous within one source file.
+
+    Rows with a ``source_row`` column (their position in the source file) are
+    split wherever that position jumps; other rows form one block per file.
+    """
+    source_groups = (
+        [group for _, group in frame.groupby("source_file", sort=False, observed=True)]
+        if "source_file" in frame.columns
+        else [frame]
+    )
+    blocks = []
+    for group in source_groups:
+        if "source_row" in group.columns:
+            group = group.drop_duplicates(subset=["source_row"]).sort_values("source_row")
+            block_ids = np.cumsum(np.r_[0, np.diff(group["source_row"].to_numpy()) != 1])
+            blocks.extend(block.reset_index(drop=True) for _, block in group.groupby(block_ids, sort=False))
+        else:
+            group = group.sort_values("Time UTC", kind="stable").drop_duplicates(subset=["Time UTC"])
+            blocks.append(group.reset_index(drop=True))
+    return blocks
+
+
+def select_flag_examples(
+    sources: Iterable[pd.DataFrame],
+    *,
+    target_flag: str,
+    classes: list[int] | tuple[int, ...],
+    good_labels: list[int] | tuple[int, ...] | None,
+    measurement_column: str,
+    points_per_panel: int,
+    avoid_context_labels: list[int] | tuple[int, ...] | None = None,
+    candidates_per_class: int = 10,
+) -> pd.DataFrame:
+    """Choose the clearest example window for each label.
+
+    ``sources`` yields dataframes (cache parts, raw files, or blocks of rows).
+    Every stretch of each label within each source file is scored with
+    ``find_flag_example_windows``. Each chosen window is thinned to at most
+    ``points_per_panel`` rows and returned with ``example_label``,
+    ``example_span`` (rows of the chosen stretch), ``example_span_rows``,
+    ``example_kind`` and ``example_outside_share``.
+    """
+    good_set = set(normalize_label_list(good_labels, DEFAULT_GOOD_LABELS))
+    avoid_set = {int(label) for label in (avoid_context_labels or ())}
+    class_list = [int(flag) for flag in classes]
+    kept: dict[int, list[dict[str, object]]] = {flag: [] for flag in class_list}
+    max_points = max(int(points_per_panel), 1)
+
+    for frame in sources:
+        source_groups = (
+            frame.groupby("source_file", sort=False, observed=True)
+            if "source_file" in frame.columns
+            else [(None, frame)]
+        )
+        for _, source_frame in source_groups:
+            if "source_row" in source_frame.columns:
+                source_frame = source_frame.sort_values("source_row", kind="stable").reset_index(drop=True)
+            else:
+                source_frame = source_frame.sort_values("Time UTC", kind="stable").reset_index(drop=True)
+                source_frame["source_row"] = np.arange(len(source_frame))
+            flags = pd.to_numeric(source_frame[target_flag], errors="coerce").fillna(-1).astype(int).to_numpy()
+            values = pd.to_numeric(source_frame[measurement_column], errors="coerce").to_numpy(dtype=float)
+            for flag in class_list:
+                kept_candidates = kept[flag]
+                for candidate in find_flag_example_windows(
+                    flags,
+                    values,
+                    flag=flag,
+                    good_labels=good_set,
+                    avoid_labels=avoid_set,
+                    points_per_panel=points_per_panel,
+                ):
+                    if len(kept_candidates) >= candidates_per_class and candidate["score"] <= kept_candidates[-1]["score"]:
+                        continue
+                    start, stop = candidate["start"], candidate["stop"]
+                    stride = max(int(np.ceil((stop - start) / max_points)), 1)
+                    window = source_frame.iloc[start:stop:stride].copy()
+                    window["example_span"] = (window["source_row"] >= candidate["span_start"]) & (
+                        window["source_row"] <= candidate["span_end"]
+                    )
+                    candidate["window"] = window
+                    kept_candidates.append(candidate)
+                    kept_candidates.sort(key=lambda item: -item["score"])
+                    del kept_candidates[candidates_per_class:]
+
+    chosen_windows = []
+    used_windows: list[tuple[object, pd.Timestamp, pd.Timestamp]] = []
+    for flag in class_list:
+        candidates = kept[flag]
+        if not candidates:
+            continue
+
+        # Prefer a window that does not overlap one already chosen for another label.
+        def overlap_share(candidate: dict[str, object]) -> float:
+            window = candidate["window"]
+            source = window["source_file"].iloc[0] if "source_file" in window.columns else None
+            start_time, end_time = window["Time UTC"].min(), window["Time UTC"].max()
+            duration = max((end_time - start_time).total_seconds(), 1.0)
+            return sum(
+                max(0.0, (min(end_time, used_end) - max(start_time, used_start)).total_seconds()) / duration
+                for used_source, used_start, used_end in used_windows
+                if used_source == source
+            )
+
+        best = next((candidate for candidate in candidates if overlap_share(candidate) < 0.5), candidates[0])
+        window = best["window"].copy()
+        window["example_label"] = flag
+        window["example_span_rows"] = best["span_end"] - best["span_start"] + 1
+        window["example_kind"] = best["kind"]
+        window["example_outside_share"] = best["outside_share"]
+        chosen_windows.append(window)
+        used_windows.append(
+            (
+                window["source_file"].iloc[0] if "source_file" in window.columns else None,
+                window["Time UTC"].min(),
+                window["Time UTC"].max(),
+            )
+        )
+
+    if not chosen_windows:
+        raise ValueError(f"No requested classes {class_list} found in {target_flag}")
+    return pd.concat(chosen_windows, ignore_index=True)
+
+
 def plot_flag_examples(
     df: pd.DataFrame,
     *,
@@ -2617,27 +2895,34 @@ def plot_flag_examples(
     region_alpha: float = 0.18,
     show_flag_points: bool = True,
 ) -> tuple[plt.Figure, pd.DataFrame]:
-    """Plot representative labelled examples with shaded regions and sensor traces.
+    """Plot the clearest labelled example of each class with shaded regions.
 
-    The important detail is that each plotted panel should stay *locally
-    contiguous in time*. When the incoming dataframe contains rows from several
-    source files or discontinuous time chunks, we therefore choose the plotting
-    window from the same ``source_file`` as the representative flagged row
-    rather than slicing across the globally sorted dataframe.
+    ``df`` is either the output of ``select_flag_examples`` (or
+    ``load_flag_example_context``), or any rows with the target and measurement
+    columns, in which case the examples are chosen here from those rows.
 
     Some raw orientation datasets are also missing the requested secondary
     column, especially when a profile points at mixed-device raw exports. In
     that case we simply omit the secondary axis instead of failing.
     """
-    available_classes = [flag for flag in classes if flag in set(df[target_flag].dropna().astype(int).unique())]
-    if not available_classes:
-        raise ValueError(f"No requested classes found in {target_flag}")
+    if measurement_column not in df.columns:
+        raise KeyError(
+            f"Measurement column {measurement_column!r} is not available for the flag-example panels. "
+            f"Available columns: {sorted(df.columns.tolist())}"
+        )
+    if "example_label" not in df.columns:
+        df = select_flag_examples(
+            _contiguous_example_blocks(df),
+            target_flag=target_flag,
+            classes=classes,
+            good_labels=good_labels,
+            measurement_column=measurement_column,
+            points_per_panel=points_per_panel,
+            avoid_context_labels=avoid_context_labels,
+        )
+    available_classes = [flag for flag in classes if flag in set(df["example_label"].astype(int))]
 
     meaning_lookup = dict(QC_FLAG_MEANINGS if label_meanings is None else label_meanings)
-    work = df.sort_values("Time UTC").reset_index(drop=True).copy()
-    duplicate_columns = [column for column in ["source_file", "Time UTC"] if column in work.columns]
-    if duplicate_columns:
-        work = work.drop_duplicates(subset=duplicate_columns).reset_index(drop=True)
     fig, axes = plt.subplots(len(available_classes), 1, figsize=(15, 3.6 * len(available_classes)), sharex=False)
     if len(available_classes) == 1:
         axes = [axes]
@@ -2647,118 +2932,22 @@ def plot_flag_examples(
     colors = dict(DEFAULT_FLAG_PALETTE)
     line_color = "#0f172a"
     temp_color = "#059669"
-    avoid_context_set = set(int(label) for label in (avoid_context_labels or ()))
-    used_panel_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-
-    def _window_overlap_share(start_a: pd.Timestamp, end_a: pd.Timestamp, start_b: pd.Timestamp, end_b: pd.Timestamp) -> float:
-        overlap_seconds = max(0.0, (min(end_a, end_b) - max(start_a, start_b)).total_seconds())
-        duration_seconds = max(1.0, (end_a - start_a).total_seconds())
-        return overlap_seconds / duration_seconds
-
-    def _contiguous_spans(row_indices: list[int]) -> list[tuple[int, int]]:
-        spans: list[tuple[int, int]] = []
-        if not row_indices:
-            return spans
-        span_start = row_indices[0]
-        previous_index = row_indices[0]
-        for row_index in row_indices[1:]:
-            if row_index == previous_index + 1:
-                previous_index = row_index
-                continue
-            spans.append((span_start, previous_index))
-            span_start = row_index
-            previous_index = row_index
-        spans.append((span_start, previous_index))
-        return spans
-
-    def _build_candidate_panel(source_panel: pd.DataFrame, span_start: int, span_end: int) -> dict[str, object]:
-        span_midpoint_index = (span_start + span_end) // 2
-        start = max(span_midpoint_index - points_per_panel // 2, 0)
-        stop = min(start + points_per_panel, len(source_panel))
-        if stop - start < points_per_panel:
-            start = max(stop - points_per_panel, 0)
-        panel = source_panel.iloc[start:stop].copy()
-
-        target_values = panel[target_flag].fillna(-1).astype(int)
-        avoid_labels_for_this_flag = avoid_context_set - {flag}
-        avoid_share = (
-            float(target_values.isin(avoid_labels_for_this_flag).mean())
-            if avoid_labels_for_this_flag
-            else 0.0
-        )
-        target_share = float((target_values == flag).mean())
-        measurement_share = float(panel[measurement_column].notna().mean()) if measurement_column in panel.columns else 0.0
-        secondary_share = (
-            float(panel[secondary_column].notna().mean())
-            if secondary_column and secondary_column in panel.columns
-            else 0.0
-        )
-        duration_seconds = 0.0
-        if len(panel) > 1:
-            duration_seconds = max(
-                0.0,
-                (panel["Time UTC"].max() - panel["Time UTC"].min()).total_seconds(),
-            )
-        average_gap_minutes = duration_seconds / max(len(panel) - 1, 1) / 60.0
-        target_position = (span_midpoint_index - start) / max(stop - start - 1, 1)
-        center_distance = abs(target_position - 0.5)
-
-        # Prefer dense, readable panels with measurement coverage and little
-        # unrelated missing-data context. This avoids "examples" where the
-        # requested label is technically present but most of the window is a
-        # long missing-data gap.
-        score = (
-            measurement_share * 3.0
-            + secondary_share * 0.5
-            + min(target_share, 0.25) * 2.0
-            - avoid_share * 6.0
-            - np.log1p(average_gap_minutes) * 0.8
-            - center_distance * 4.0
-        )
-        panel_start = panel["Time UTC"].min()
-        panel_end = panel["Time UTC"].max()
-        overlap_penalty = sum(
-            _window_overlap_share(panel_start, panel_end, used_start, used_end)
-            for used_start, used_end in used_panel_windows
-        )
-        score -= overlap_penalty * 8.0
-        return {
-            "panel": panel,
-            "example_time": source_panel.iloc[span_midpoint_index]["Time UTC"],
-            "center_row": source_panel.iloc[span_midpoint_index],
-            "score": float(score),
-            "avoid_context_share": avoid_share,
-            "target_label_share": target_share,
-            "measurement_available_share": measurement_share,
-            "average_gap_minutes": float(average_gap_minutes),
-            "target_position": float(target_position),
-        }
 
     for axis, flag in zip(axes, available_classes):
-        source_groups = (
-            work.groupby("source_file", sort=False, observed=False)
-            if "source_file" in work.columns
-            else [(None, work)]
-        )
-        candidates = []
-        for _, source_frame in source_groups:
-            source_panel = source_frame.sort_values("Time UTC").reset_index(drop=True)
-            source_flag_rows = source_panel.index[source_panel[target_flag].fillna(-1).astype(int) == flag].tolist()
-            for span_start_index, span_end_index in _contiguous_spans(source_flag_rows):
-                candidates.append(_build_candidate_panel(source_panel, span_start_index, span_end_index))
-        if not candidates:
-            raise ValueError(f"No requested class {flag} found in {target_flag}")
-        best_candidate = max(candidates, key=lambda candidate: candidate["score"])
-        panel = best_candidate["panel"]
-        example_time = best_candidate["example_time"]
-        center_row = best_candidate["center_row"]
-        used_panel_windows.append((panel["Time UTC"].min(), panel["Time UTC"].max()))
+        panel = df.loc[df["example_label"].astype(int) == flag].sort_values("source_row").copy()
+        span_rows = panel.loc[panel["example_span"].astype(bool)]
         panel_spans = _iter_flag_spans(panel, target_flag, good_labels=good_labels)
         flags_in_panel = sorted({span_flag for span_flag, _, _ in panel_spans})
 
         # Shade all non-good QC spans so participants can see the local context
-        # around the example class rather than only isolated points.
+        # around the example class rather than only isolated points. Very short
+        # spans of the example's own label are widened to a thin visible band.
+        minimum_span = (panel["Time UTC"].max() - panel["Time UTC"].min()) * 0.004
         for span_flag, span_start, span_end in panel_spans:
+            if span_flag == flag and span_end - span_start < minimum_span:
+                span_middle = span_start + (span_end - span_start) / 2
+                span_start = span_middle - minimum_span / 2
+                span_end = span_middle + minimum_span / 2
             axis.axvspan(
                 span_start,
                 span_end,
@@ -2768,14 +2957,20 @@ def plot_flag_examples(
                 zorder=0,
             )
 
-        if measurement_column not in panel.columns:
-            raise KeyError(
-                f"Measurement column {measurement_column!r} is not available in the flag-example panel. "
-                f"Available columns: {sorted(panel.columns.tolist())}"
-            )
-
         axis.plot(panel["Time UTC"], panel[measurement_column], color=line_color, linewidth=1.8, label=measurement_column)
-        if show_flag_points and flag not in normalized_good_labels:
+        # Fit the y-axis to the example stretch and the bulk of the panel, so a
+        # distant spike elsewhere in the panel cannot flatten the stretch.
+        panel_values = pd.to_numeric(panel[measurement_column], errors="coerce").dropna()
+        span_values = pd.to_numeric(span_rows[measurement_column], errors="coerce").dropna()
+        if len(panel_values):
+            y_low, y_high = panel_values.quantile([0.005, 0.995])
+            if len(span_values):
+                y_low, y_high = min(y_low, span_values.min()), max(y_high, span_values.max())
+            y_padding = (y_high - y_low) * 0.05 or abs(y_high) * 0.01 or 1.0
+            axis.set_ylim(y_low - y_padding, y_high + y_padding)
+        target_points = pd.DataFrame()
+        # Short stretches always get points, so a single flagged row stands out.
+        if (show_flag_points or len(span_rows) <= 50) and flag not in normalized_good_labels:
             target_points = panel.loc[panel[target_flag].fillna(-1).astype(int) == flag, ["Time UTC", measurement_column]]
             target_points = target_points.dropna(subset=[measurement_column])
             if not target_points.empty:
@@ -2816,7 +3011,7 @@ def plot_flag_examples(
         ]
         if secondary_available:
             legend_handles.append(Line2D([0], [0], color=temp_color, linewidth=2, label=secondary_column))
-        if show_flag_points and flag not in normalized_good_labels:
+        if not target_points.empty:
             legend_handles.append(
                 Line2D(
                     [0],
@@ -2846,22 +3041,49 @@ def plot_flag_examples(
                 "target_column": target_flag,
                 "target_label": flag,
                 "meaning": meaning_lookup.get(flag, "unknown"),
+                "source_file": clean_source_file_label(panel["source_file"].iloc[0]) if "source_file" in panel.columns else None,
+                "stretch_start": span_rows["Time UTC"].min(),
+                "stretch_end": span_rows["Time UTC"].max(),
+                "stretch_rows": int(panel["example_span_rows"].iloc[0]),
+                "example_kind": panel["example_kind"].iloc[0],
+                "share_outside_good_range": round(float(panel["example_outside_share"].iloc[0]), 3),
                 "panel_start": panel["Time UTC"].min(),
                 "panel_end": panel["Time UTC"].max(),
-                "example_time": example_time,
-                "source_file": clean_source_file_label(center_row["source_file"]) if "source_file" in work.columns else None,
-                "avoid_context_share": best_candidate["avoid_context_share"],
-                "target_label_share": best_candidate["target_label_share"],
-                "measurement_available_share": best_candidate["measurement_available_share"],
-                "average_gap_minutes": best_candidate["average_gap_minutes"],
-                "target_position": best_candidate["target_position"],
             }
         )
 
     axes[-1].set_xlabel("Time UTC")
-    fig.suptitle(f"Representative time-series examples for different {target_display_name} values", y=1.02)
+    fig.suptitle(f"Clearest time-series examples for different {target_display_name} values", y=1.02)
     fig.tight_layout()
     return fig, pd.DataFrame(example_rows)
+
+
+def describe_flag_examples(
+    examples: pd.DataFrame,
+    *,
+    measurement_column: str,
+    target_display_name: str = "QC flag",
+) -> list[str]:
+    """Explain in one sentence how visible each plotted issue example is."""
+    notes = []
+    for example in examples.itertuples(index=False):
+        name = f"{target_display_name} {example.target_label} ({example.meaning})"
+        if example.example_kind == "gap":
+            notes.append(f"{name}: the flagged rows have no {measurement_column} value, so the line has a gap there.")
+        elif example.example_kind == "values":
+            outside_share = example.share_outside_good_range
+            if pd.notna(outside_share) and outside_share >= 0.5:
+                notes.append(
+                    f"{name}: {outside_share:.0%} of the flagged values lie outside the range of the good values "
+                    "around them, so the flag is easy to see."
+                )
+            else:
+                share_text = "none" if pd.isna(outside_share) or outside_share == 0 else f"only {outside_share:.0%}"
+                notes.append(
+                    f"{name}: {share_text} of the flagged values lie outside the range of the good values around them, "
+                    f"even in the clearest example. The reason for this label does not show in {measurement_column}."
+                )
+    return notes
 
 
 def plot_cluster_window_examples(

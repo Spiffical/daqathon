@@ -203,7 +203,8 @@ On Alliance clusters, the notebooks treat the shared project space as the long-l
 
 That means:
 
-- if `$SLURM_TMPDIR` is available, the notebook copies the shared raw CSV directory and the shared prepared cache into node-local job storage before reading them
+- if `$SLURM_TMPDIR` is available, the data-preparation notebook copies the chosen dataset's raw CSV folder and its prepared cache (not every dataset's cache) into node-local job storage before reading them
+- the machine-learning notebooks read the prepared cache from shared storage, or from that staged copy when the data-preparation notebook already made one in the same JupyterHub session
 - shared raw data and shared cache stay as the long-lived sources
 - your notebook run gets a fast writable per-run working area
 - generated files do not pollute shared project storage
